@@ -259,7 +259,7 @@ static void paceToPts(long long auPts) {
 // free-running u32 head/tail counters wrap cleanly; index = pos & RING_MASK.
 static constexpr u32 RING_SZ   = 4u * 1024 * 1024;   // ~21 s at 1.5 Mbps
 static constexpr u32 RING_MASK = RING_SZ - 1;
-static constexpr u32 PREBUF_SZ = 1u * 1024 * 1024;   // fill this much before playing
+static constexpr u32 PREBUF_SZ = 512u * 1024;        // fill this much before playing
 
 struct DlRing {
     u8*           data;
@@ -661,6 +661,11 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     Thread dlThr = threadCreate(dlThread, &g_ring, 32 * 1024, mainPrio, 0, false);
     if (dbg) { fprintf(dbg, "dlThread=%p prio=%ld\n", (void*)dlThr, (long)mainPrio); fflush(dbg); }
 
+    // "Buffering…" hint at the top of the console so a stall reads as buffering
+    // rather than a crash. rebuf tracks whether the hint is currently shown.
+    bool rebuf = true;
+    if (!g_dbg) printf("\x1b[1;5HBuffering...   ");
+
     // Prebuffer: wait until the ring holds PREBUF_SZ (or the stream ended) so a
     // brief network dip after playback starts doesn't immediately underrun.
     while (!stop && ringUsed() < PREBUF_SZ && !g_ring.producerDone) {
@@ -745,6 +750,15 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                 } else if (pesActive && pesLen+psz<=PES_SZ) {
                     memcpy(pesBuf+pesLen,pay,psz); pesLen+=psz;
                 }
+            }
+        }
+
+        // Buffering indicator: clear once frames flow again, re-show on underrun.
+        if (!g_dbg) {
+            if (processed > 0) {
+                if (rebuf) { printf("\x1b[1;5H               "); rebuf = false; }
+            } else if (!g_ring.producerDone && !rebuf) {
+                printf("\x1b[1;5HBuffering...   "); rebuf = true;
             }
         }
 

@@ -266,7 +266,10 @@ std::string JellyfinClient::getStreamUrl(const std::string& itemId) const {
              // no CABAC. Both make the stream much friendlier to the MVD decoder.
              "&Profile=baseline"
              "&AudioCodec=aac"
-             "&VideoBitrate=1500000"
+             // 1.0 Mbps keeps headroom under 3DS Wi-Fi throughput so the ring
+             // buffer refills faster than playback drains it (no underrun freeze).
+             // Plenty for 400x224. Lower further (e.g. 800000) if it still stalls.
+             "&VideoBitrate=1000000"
              "&MaxWidth=400"
              "&MaxHeight=240"
              "&SubtitleMethod=None"
