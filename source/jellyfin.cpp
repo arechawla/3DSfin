@@ -261,6 +261,10 @@ std::string JellyfinClient::getStreamUrl(const std::string& itemId) const {
              "&api_key=%s"
              "&DeviceId=%s"
              "&VideoCodec=h264"
+             // Force Baseline profile: no B-frames (so decode order == display
+             // order — we blit frames as they decode, with no reorder buffer) and
+             // no CABAC. Both make the stream much friendlier to the MVD decoder.
+             "&Profile=baseline"
              "&AudioCodec=aac"
              "&VideoBitrate=1500000"
              "&MaxWidth=400"

@@ -215,6 +215,109 @@ static void blitFrame(const u8* mvdOut, u32 frameCount) {
 // Mirrors to the on-screen console (only when debug is enabled) and always to file.
 #define DLOG(dbg, ...) do { if (g_dbg) printf(__VA_ARGS__); if(dbg){fprintf(dbg,__VA_ARGS__);fflush(dbg);} } while(0)
 
+// ─── PTS-based frame pacing ───────────────────────────────────────────────────
+// Without pacing, frames blit as fast as they decode, which is bursty: HTTP
+// delivers data in chunks, each holding several frames, so playback fast-forwards
+// through a burst (one vblank per frame) then freezes waiting for the next chunk.
+// We anchor wall-clock time to the first displayed frame's PTS and, before every
+// later frame, sleep until its scheduled presentation time. When decode can't keep
+// up (now is already past target) nothing sleeps, so we never play slower than the
+// hardware allows — pacing only smooths the too-fast bursts.
+static long long g_pacePts0  = -1;   // 90 kHz PTS of the first displayed frame
+static u64       g_paceWall0 = 0;    // osGetTime() (ms) captured at that first frame
+static void paceToPts(long long auPts) {
+    if (auPts < 0) return;                            // no PTS on this AU → can't pace
+    if (g_pacePts0 < 0) {                             // first frame: set the anchor
+        g_pacePts0 = auPts; g_paceWall0 = osGetTime();
+        return;
+    }
+    long long dpts = auPts - g_pacePts0;
+    if (dpts < 0) dpts += (1LL << 33);                // 33-bit PTS wraparound
+    u64 target = g_paceWall0 + (u64)(dpts / 90);      // 90 kHz ticks → ms
+    u64 now    = osGetTime();
+    if (target > now) {                               // ahead of schedule → wait
+        u64 waitMs = target - now;
+        if (waitMs > 1000) waitMs = 1000;             // cap: PTS-discontinuity safety
+        DBG("pace %lums\n", (unsigned long)waitMs);
+        svcSleepThread((s64)waitMs * 1000000LL);
+    } else if (now - target > 200) {
+        // Fell well behind (network stall starved the decoder). Don't race to catch
+        // up — that dumps the backlog at max speed and looks like a fast-forward
+        // shake. Re-anchor the clock to "now" and resume smooth pacing from here.
+        g_pacePts0 = auPts; g_paceWall0 = now;
+        DBG("pace resync\n");
+    }
+}
+
+// ─── Read-ahead download ring buffer ──────────────────────────────────────────
+// A background thread continuously pulls the HTTP TS stream into this ring while
+// the main thread demuxes/decodes/paces out of it. This decouples network I/O
+// from display timing: when paceToPts() sleeps to hold a frame to its real
+// presentation time, the download thread keeps the buffer full instead of the
+// socket starving — which is what previously caused the stutter (a single thread
+// can't both pace display AND keep reading). RING_SZ is a power of two so the
+// free-running u32 head/tail counters wrap cleanly; index = pos & RING_MASK.
+static constexpr u32 RING_SZ   = 4u * 1024 * 1024;   // ~21 s at 1.5 Mbps
+static constexpr u32 RING_MASK = RING_SZ - 1;
+static constexpr u32 PREBUF_SZ = 1u * 1024 * 1024;   // fill this much before playing
+
+struct DlRing {
+    u8*           data;
+    httpcContext* ctx;
+    volatile u32  head;          // producer: total bytes written
+    volatile u32  tail;          // consumer: total bytes consumed
+    volatile bool producerDone;  // stream ended/errored — no more data coming
+    volatile bool consumerStop;  // consumer asked the producer to stop
+    LightLock     lock;          // guards the head/tail snapshot
+};
+static DlRing g_ring;
+
+static inline u32 ringUsed() {
+    LightLock_Lock(&g_ring.lock);
+    u32 u = g_ring.head - g_ring.tail;   // wrap-safe: both are free-running u32
+    LightLock_Unlock(&g_ring.lock);
+    return u;
+}
+
+// Producer thread: download HTTP into the ring until the stream ends or the
+// consumer asks us to stop. Mirrors the old loop's "stop when not DOWNLOADPENDING".
+static void dlThread(void* arg) {
+    DlRing* r = (DlRing*)arg;
+    while (!r->consumerStop) {
+        u32 freeb = RING_SZ - ringUsed();
+        if (freeb < TS_SZ) { svcSleepThread(2000000LL); continue; }   // full → wait 2ms
+        u32 hi     = r->head & RING_MASK;
+        u32 contig = RING_SZ - hi;                  // contiguous run to end of buffer
+        u32 want   = freeb < contig ? freeb : contig;
+        if (want > RD_SZ) want = RD_SZ;             // cap per download call
+        u32 got = 0;
+        Result dl = httpcDownloadData(r->ctx, r->data + hi, want, &got);
+        if (got > 0) {
+            LightLock_Lock(&r->lock);
+            r->head += got;
+            LightLock_Unlock(&r->lock);
+        }
+        if (dl != (Result)HTTPC_RESULTCODE_DOWNLOADPENDING) break;    // stream finished
+    }
+    r->producerDone = true;
+}
+
+// Consumer side: copy exactly n bytes out of the ring (handling wrap). The caller
+// must have already confirmed ringUsed() >= n.
+static void ringTake(u8* out, u32 n) {
+    u32 ti     = g_ring.tail & RING_MASK;
+    u32 contig = RING_SZ - ti;
+    if (contig >= n) {
+        memcpy(out, g_ring.data + ti, n);
+    } else {
+        memcpy(out, g_ring.data + ti, contig);
+        memcpy(out + contig, g_ring.data, n - contig);
+    }
+    LightLock_Lock(&g_ring.lock);
+    g_ring.tail += n;
+    LightLock_Unlock(&g_ring.lock);
+}
+
 // Sentinel marker positions: 4 corners of the BGR565 output buffer, using the
 // CURRENT coded dimensions (g_decW/g_decH) so they match where MVD writes.
 // MVD overwrites these when it actually decodes a frame; if they survive a
@@ -303,7 +406,7 @@ static bool parseSPS(const u8* nal, u32 len, u32* outW, u32* outH) {
 static void processH264(u8* pes, u32 pesLen,
                         u8* feedBuf, u8* mvdOut,
                         MVDSTD_Config* cfg, bool* first,
-                        bool* stop, u32* frameCount, FILE* dbg) {
+                        bool* stop, u32* frameCount, FILE* dbg, long long auPts) {
     (void)first;
     static u32 auCount = 0;
     auCount++;
@@ -388,6 +491,7 @@ static void processH264(u8* pes, u32 pesLen,
                      (unsigned long)rr, (int)got, mvdOut[0], mvdOut[1]);
 
         if (got) {
+            paceToPts(auPts);            // sleep until this frame's presentation time
             blitFrame(mvdOut, *frameCount);
             (*frameCount)++;
             if (*frameCount <= 5) DLOG(dbg, "frame %u\n", (unsigned)*frameCount);
@@ -435,16 +539,16 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         fflush(dbg);
     }
 
-    // Linear memory buffers
-    u8* rdBuf  = (u8*)linearAlloc(RD_SZ);
-    u8* pesBuf = (u8*)linearAlloc(PES_SZ);
-    u8* nalBuf = (u8*)linearAlloc(NAL_SZ);
-    u8* mvdOut = (u8*)linearAlloc(VID_W * VID_H * 2);
+    // Linear memory buffers (g_ring.data is the background download ring)
+    g_ring.data = (u8*)linearAlloc(RING_SZ);
+    u8* pesBuf  = (u8*)linearAlloc(PES_SZ);
+    u8* nalBuf  = (u8*)linearAlloc(NAL_SZ);
+    u8* mvdOut  = (u8*)linearAlloc(VID_W * VID_H * 2);
 
-    if (!rdBuf || !pesBuf || !nalBuf || !mvdOut) {
+    if (!g_ring.data || !pesBuf || !nalBuf || !mvdOut) {
         printf("alloc failed\n");
         if (dbg) { fprintf(dbg, "alloc failed\n"); fclose(dbg); }
-        linearFree(rdBuf); linearFree(pesBuf);
+        linearFree(g_ring.data); linearFree(pesBuf);
         linearFree(nalBuf); linearFree(mvdOut);
         svcSleepThread(3000000000LL);
         return false;
@@ -454,6 +558,9 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     // Reset coded dims to the max so the first SPS always triggers reconfigure.
     g_decW = VID_W; g_decH = VID_H;
 
+    // Reset the frame-pacing anchor (set on the first displayed frame below).
+    g_pacePts0 = -1; g_paceWall0 = 0;
+
     // Init MVD hardware decoder
     Result mvdRet = mvdstdInit(MVDMODE_VIDEOPROCESSING,
                                MVD_INPUT_H264, MVD_OUTPUT_BGR565,
@@ -461,7 +568,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     if (R_FAILED(mvdRet)) {
         printf("mvdstdInit fail: 0x%08X\n", (unsigned)mvdRet);
         if (dbg) { fprintf(dbg, "mvdstdInit fail: 0x%08X\n", (unsigned)mvdRet); fclose(dbg); }
-        linearFree(rdBuf); linearFree(pesBuf);
+        linearFree(g_ring.data); linearFree(pesBuf);
         linearFree(nalBuf); linearFree(mvdOut);
         svcSleepThread(3000000000LL);
         return false;
@@ -505,7 +612,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         printf("HTTP fail, B to exit\n");
         if (dbg) fclose(dbg);
         mvdstdExit();
-        linearFree(rdBuf); linearFree(pesBuf);
+        linearFree(g_ring.data); linearFree(pesBuf);
         linearFree(nalBuf); linearFree(mvdOut);
         // Wait for B so user can read the error
         while (aptMainLoop()) {
@@ -527,17 +634,43 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     u32  frameCount = 0;
     u32  pktCount   = 0;
 
-    u8  partial[TS_SZ];
-    int partialLen = 0;
     bool dbgComboPrev = false;   // edge-detect for the X + D-Pad Up debug toggle
 
     // Seek-bar state: position from PES PTS, total from the Jellyfin item.
     double    durSec      = runTimeTicks > 0 ? runTimeTicks / 10000000.0 : 0.0;
     double    posSec      = 0.0;
     long long firstPts    = -1;          // PTS of the first frame (position origin)
+    long long curPesPts   = -1;          // PTS of the access unit now being accumulated
     int       lastShownSec = -1;         // throttle: redraw bar only when seconds change
 
     if (!g_dbg) drawMeta(series, title, year);   // static metadata above the seek bar
+
+    // Start the background download thread filling the ring. Same priority as the
+    // main thread so the two round-robin on the core; the main thread yields often
+    // (pacing sleeps, vblank waits), letting the producer keep the ring topped up.
+    g_ring.ctx          = &ctx;
+    g_ring.head         = 0;
+    g_ring.tail         = 0;
+    g_ring.producerDone = false;
+    g_ring.consumerStop = false;
+    LightLock_Init(&g_ring.lock);
+    s32 mainPrio = 0x30;
+    svcGetThreadPriority(&mainPrio, CUR_THREAD_HANDLE);
+    // core 0 (same as main): equal-priority round-robin, and a shared L1 so the
+    // ring memory is trivially coherent between producer and consumer.
+    Thread dlThr = threadCreate(dlThread, &g_ring, 32 * 1024, mainPrio, 0, false);
+    if (dbg) { fprintf(dbg, "dlThread=%p prio=%ld\n", (void*)dlThr, (long)mainPrio); fflush(dbg); }
+
+    // Prebuffer: wait until the ring holds PREBUF_SZ (or the stream ended) so a
+    // brief network dip after playback starts doesn't immediately underrun.
+    while (!stop && ringUsed() < PREBUF_SZ && !g_ring.producerDone) {
+        hidScanInput();
+        if (hidKeysDown() & KEY_B) { stop = true; break; }
+        svcSleepThread(10000000LL);   // 10ms
+    }
+
+    // A single reusable TS packet scratch (the ring hands out whole packets).
+    u8 pkt[TS_SZ];
 
     while (!stop) {
         hidScanInput();
@@ -557,118 +690,62 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
 
         if (hidKeysDown() & KEY_B) break;
 
-        u32    got   = 0;
-        Result dlret = httpcDownloadData(&ctx, rdBuf, RD_SZ, &got);
-
-        u8*  cur       = rdBuf;
-        u32  remaining = got;
-
-        // Finish any partial packet carried from last read
-        if (partialLen > 0 && got > 0) {
-            int need = TS_SZ - partialLen;
-            if ((int)remaining >= need) {
-                memcpy(partial + partialLen, cur, need);
-                cur += need; remaining -= need; partialLen = 0;
-                if (partial[0] == 0x47) {
-                    int pid = tsPid(partial);
-                    int psz = 0;
-                    const u8* pay = tsPayload(partial, &psz);
-                    bool pusi = tsPUSI(partial);
-                    if (pid==0 && pay && pmtPid==-1) {
-                        pmtPid = parsePAT(pay, psz);
-                        if (pmtPid!=-1) {
-                            DBG("PAT->pmtPid=%d\n", pmtPid);
-                            if (dbg) { fprintf(dbg,"PAT pmtPid=%d\n",pmtPid); fflush(dbg); }
-                        }
-                    } else if (pmtPid!=-1 && pid==pmtPid && pay && vidPid==-1) {
-                        vidPid = parsePMT(pay, psz);
-                        if (vidPid!=-1) {
-                            DBG("PMT->vidPid=%d\n", vidPid);
-                            if (dbg) { fprintf(dbg,"PMT vidPid=%d\n",vidPid); fflush(dbg); }
-                        }
-                    } else if (vidPid!=-1 && pid==vidPid && pay) {
-                        if (pusi) {
-                            long long pts = pesPTS(pay, psz);
-                            if (pts >= 0) {
-                                if (firstPts < 0) firstPts = pts;
-                                long long d = pts - firstPts;
-                                if (d < 0) d += (1LL << 33);   // 33-bit PTS wraparound
-                                posSec = d / 90000.0;
-                            }
-                            if (pesActive && pesLen > 0)
-                                processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg);
-                            int skip = pesHeaderLen(pay,psz);
-                            pesLen = 0; pesActive = true;
-                            int cp = psz-skip;
-                            if (cp>0 && (u32)cp<=PES_SZ) { memcpy(pesBuf,pay+skip,cp); pesLen=cp; }
-                        } else if (pesActive && pesLen+psz<=PES_SZ) {
-                            memcpy(pesBuf+pesLen,pay,psz); pesLen+=psz;
-                        }
-                    }
-                }
-            } else {
-                memcpy(partial+partialLen, cur, remaining);
-                partialLen += remaining; remaining = 0;
-            }
-        }
-
-        // Process full TS packets from the read buffer
-        while (!stop && remaining >= TS_SZ) {
+        // Drain whole TS packets out of the ring. Decoding a frame paces+blits
+        // inside processH264 (it may sleep); meanwhile dlThread keeps refilling the
+        // ring. Cap the batch so the debug toggle and seek bar stay responsive.
+        int processed = 0;
+        while (!stop && ringUsed() >= TS_SZ && processed < 128) {
+            ringTake(pkt, TS_SZ);
+            processed++;
             pktCount++;
-            // Progress update every 500 packets
             if (pktCount % 500 == 0) {
                 DBG("pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
                 if (dbg) {
-                    fprintf(dbg,"pkts=%u pmtPid=%d vidPid=%d frames=%u\n",
-                            (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount);
+                    fprintf(dbg,"pkts=%u pmtPid=%d vidPid=%d frames=%u used=%u\n",
+                            (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount,
+                            (unsigned)ringUsed());
                     fflush(dbg);
                 }
             }
 
-            if (cur[0] == 0x47) {
-                int pid = tsPid(cur);
-                int psz = 0;
-                const u8* pay = tsPayload(cur, &psz);
-                bool pusi = tsPUSI(cur);
+            if (pkt[0] != 0x47) continue;
+            int pid = tsPid(pkt);
+            int psz = 0;
+            const u8* pay = tsPayload(pkt, &psz);
+            bool pusi = tsPUSI(pkt);
 
-                if (pid==0 && pay && pmtPid==-1) {
-                    pmtPid = parsePAT(pay, psz);
-                    if (pmtPid!=-1) {
-                        DBG("PAT->pmtPid=%d\n", pmtPid);
-                        if (dbg) { fprintf(dbg,"PAT pmtPid=%d\n",pmtPid); fflush(dbg); }
+            if (pid==0 && pay && pmtPid==-1) {
+                pmtPid = parsePAT(pay, psz);
+                if (pmtPid!=-1) {
+                    DBG("PAT->pmtPid=%d\n", pmtPid);
+                    if (dbg) { fprintf(dbg,"PAT pmtPid=%d\n",pmtPid); fflush(dbg); }
+                }
+            } else if (pmtPid!=-1 && pid==pmtPid && pay && vidPid==-1) {
+                vidPid = parsePMT(pay, psz);
+                if (vidPid!=-1) {
+                    DBG("PMT->vidPid=%d\n", vidPid);
+                    if (dbg) { fprintf(dbg,"PMT vidPid=%d\n",vidPid); fflush(dbg); }
+                }
+            } else if (vidPid!=-1 && pid==vidPid && pay) {
+                if (pusi) {
+                    long long pts = pesPTS(pay, psz);
+                    if (pts >= 0) {
+                        if (firstPts < 0) firstPts = pts;
+                        long long d = pts - firstPts;
+                        if (d < 0) d += (1LL << 33);   // 33-bit PTS wraparound
+                        posSec = d / 90000.0;
                     }
-                } else if (pmtPid!=-1 && pid==pmtPid && pay && vidPid==-1) {
-                    vidPid = parsePMT(pay, psz);
-                    if (vidPid!=-1) {
-                        DBG("PMT->vidPid=%d\n", vidPid);
-                        if (dbg) { fprintf(dbg,"PMT vidPid=%d\n",vidPid); fflush(dbg); }
-                    }
-                } else if (vidPid!=-1 && pid==vidPid && pay) {
-                    if (pusi) {
-                        long long pts = pesPTS(pay, psz);
-                        if (pts >= 0) {
-                            if (firstPts < 0) firstPts = pts;
-                            long long d = pts - firstPts;
-                            if (d < 0) d += (1LL << 33);   // 33-bit PTS wraparound
-                            posSec = d / 90000.0;
-                        }
-                        if (pesActive && pesLen > 0)
-                            processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg);
-                        int skip = pesHeaderLen(pay,psz);
-                        pesLen = 0; pesActive = true;
-                        int cp = psz-skip;
-                        if (cp>0 && (u32)cp<=PES_SZ) { memcpy(pesBuf,pay+skip,cp); pesLen=cp; }
-                    } else if (pesActive && pesLen+psz<=PES_SZ) {
-                        memcpy(pesBuf+pesLen,pay,psz); pesLen+=psz;
-                    }
+                    if (pesActive && pesLen > 0)
+                        processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg,curPesPts);
+                    curPesPts = pts;   // PTS now belongs to the AU starting here
+                    int skip = pesHeaderLen(pay,psz);
+                    pesLen = 0; pesActive = true;
+                    int cp = psz-skip;
+                    if (cp>0 && (u32)cp<=PES_SZ) { memcpy(pesBuf,pay+skip,cp); pesLen=cp; }
+                } else if (pesActive && pesLen+psz<=PES_SZ) {
+                    memcpy(pesBuf+pesLen,pay,psz); pesLen+=psz;
                 }
             }
-            cur += TS_SZ; remaining -= TS_SZ;
-        }
-
-        if (remaining > 0) {
-            memcpy(partial, cur, remaining);
-            partialLen = remaining;
         }
 
         // Refresh the seek bar once per second of playback (skip while the debug
@@ -678,7 +755,10 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
             lastShownSec = (int)posSec;
         }
 
-        if (dlret != (Result)HTTPC_RESULTCODE_DOWNLOADPENDING) break;
+        // Stream finished and fully drained → done.
+        if (g_ring.producerDone && ringUsed() < TS_SZ) break;
+        // Nothing to do this pass (waiting on the network) → yield briefly.
+        if (processed == 0) svcSleepThread(5000000LL);   // 5ms
     }
 
     DBG("End: pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
@@ -690,10 +770,16 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
 
     svcSleepThread(2000000000LL); // show stats for 2s before returning
 
+    // Stop the producer: ask it to quit, then cancel any in-flight download so a
+    // blocking httpcDownloadData returns and the thread can exit, then join it.
+    g_ring.consumerStop = true;
     httpcCancelConnection(&ctx);
+    threadJoin(dlThr, 5000000000LL);
+    threadFree(dlThr);
+
     httpcCloseContext(&ctx);
     mvdstdExit();
-    linearFree(rdBuf); linearFree(pesBuf);
+    linearFree(g_ring.data); linearFree(pesBuf);
     linearFree(nalBuf); linearFree(mvdOut);
     return true;
 }
