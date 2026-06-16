@@ -11,8 +11,9 @@ struct JellyfinLibrary {
 
 struct JellyfinItem {
     std::string id;
-    std::string name;
+    std::string name;           // movie title / episode name
     std::string type;           // "Movie", "Episode", "Series"
+    std::string seriesName;     // parent series (episodes only)
     long long   runTimeTicks;   // 10,000,000 ticks per second
     int         productionYear;
 };

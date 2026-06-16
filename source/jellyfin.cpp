@@ -226,6 +226,7 @@ std::vector<JellyfinItem> JellyfinClient::getItems(const std::string& parentId,
         item.id             = jStr(obj, "Id");
         item.name           = jStr(obj, "Name");
         item.type           = jStr(obj, "Type");
+        item.seriesName     = jStr(obj, "SeriesName");   // present for episodes
         item.productionYear = 0;
         item.runTimeTicks   = 0;
 

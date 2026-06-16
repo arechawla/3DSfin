@@ -270,7 +270,10 @@ int main() {
                 C2D_Fini();
                 C3D_Fini();
 
-                playerPlay(playerUrl, items[selItem].runTimeTicks);
+                playerPlay(playerUrl, items[selItem].runTimeTicks,
+                           items[selItem].seriesName,
+                           items[selItem].name,
+                           items[selItem].productionYear);
 
                 C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
                 C2D_Init(C2D_DEFAULT_MAX_OBJECTS);

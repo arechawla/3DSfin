@@ -134,6 +134,14 @@ static void drawSeekBar(double posSec, double durSec) {
     printf("\x1b[29;5H[%s]", bar);
 }
 
+// Series name / episode title / year, each on its own line just above the seek
+// bar. Positioned with ANSI escapes; %.*s clamps to the console width.
+static void drawMeta(const std::string& series, const std::string& title, int year) {
+    if (!series.empty()) printf("\x1b[22;5H%.34s", series.c_str());
+    if (!title.empty())  printf("\x1b[23;5H%.34s", title.c_str());
+    if (year > 0)        printf("\x1b[24;5H%d", year);
+}
+
 // ─── Blit 400x240 BGR565 -> 240x400 BGR8 and swap ────────────────────────────
 // 3DS top-screen layout: column-major, 240 rows per column.
 // Logical (x,y) -> physical offset = (x*240 + (239-y)) * 3
@@ -360,7 +368,8 @@ static void processH264(u8* pes, u32 pesLen,
 }
 
 // ─── Player entry point ───────────────────────────────────────────────────────
-bool playerPlay(const std::string& url, long long runTimeTicks) {
+bool playerPlay(const std::string& url, long long runTimeTicks,
+                const std::string& series, const std::string& title, int year) {
     // C2D_CreateScreenTarget replaced gfx's framebuffer pointers with its own VRAM
     // allocation. After C3D_Fini that VRAM is freed but the pointers stay stale.
     // gfxSetScreenFormat is a no-op when the format hasn't changed, so it doesn't
@@ -498,6 +507,8 @@ bool playerPlay(const std::string& url, long long runTimeTicks) {
     long long firstPts    = -1;          // PTS of the first frame (position origin)
     int       lastShownSec = -1;         // throttle: redraw bar only when seconds change
 
+    if (!g_dbg) drawMeta(series, title, year);   // static metadata above the seek bar
+
     while (!stop) {
         hidScanInput();
 
@@ -506,7 +517,11 @@ bool playerPlay(const std::string& url, long long runTimeTicks) {
         if (dbgCombo && !dbgComboPrev) {
             g_dbg = !g_dbg;
             if (g_dbg) printf("[debug ON]\n");
-            else     { consoleClear(); lastShownSec = -1; }  // clear + force bar redraw
+            else {                                     // back to clean view: redraw all
+                consoleClear();
+                drawMeta(series, title, year);
+                lastShownSec = -1;                     // force seek-bar redraw
+            }
         }
         dbgComboPrev = dbgCombo;
 
