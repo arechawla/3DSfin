@@ -1,2 +1,9 @@
 player_debug.txt
 playmp4context.md
+# devkitARM / 3DS build output
+build/
+*.3dsx
+*.elf
+*.smdh
+*.cia
+*.3ds
