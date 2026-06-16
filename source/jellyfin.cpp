@@ -266,6 +266,11 @@ std::string JellyfinClient::getStreamUrl(const std::string& itemId) const {
              // no CABAC. Both make the stream much friendlier to the MVD decoder.
              "&Profile=baseline"
              "&AudioCodec=aac"
+             // Cap + downmix audio. A 5.1 source otherwise transcodes to ~384 kbit/s
+             // AAC — which nearly DOUBLES the stream and, since we don't play audio
+             // yet, is pure wasted RF budget. Stereo @ 96 kbit/s frees it for video.
+             "&AudioBitrate=96000"
+             "&MaxAudioChannels=2"
              // Bitrate must stay UNDER sustained 3DS Wi-Fi throughput or the ring
              // buffer drains faster than it fills and playback buffers every few
              // seconds. 0.4 Mbps for headroom on a marginal link; still fine for
