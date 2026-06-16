@@ -257,9 +257,10 @@ static void paceToPts(long long auPts) {
 // socket starving — which is what previously caused the stutter (a single thread
 // can't both pace display AND keep reading). RING_SZ is a power of two so the
 // free-running u32 head/tail counters wrap cleanly; index = pos & RING_MASK.
-static constexpr u32 RING_SZ   = 4u * 1024 * 1024;   // ~21 s at 1.5 Mbps
+static constexpr u32 RING_SZ   = 4u * 1024 * 1024;   // ~50 s at 0.6 Mbps
 static constexpr u32 RING_MASK = RING_SZ - 1;
 static constexpr u32 PREBUF_SZ = 512u * 1024;        // fill this much before playing
+static constexpr u32 DL_CHUNK  = 128u * 1024;        // bytes per httpcDownloadData call
 
 struct DlRing {
     u8*           data;
@@ -289,7 +290,7 @@ static void dlThread(void* arg) {
         u32 hi     = r->head & RING_MASK;
         u32 contig = RING_SZ - hi;                  // contiguous run to end of buffer
         u32 want   = freeb < contig ? freeb : contig;
-        if (want > RD_SZ) want = RD_SZ;             // cap per download call
+        if (want > DL_CHUNK) want = DL_CHUNK;        // cap per download call
         u32 got = 0;
         Result dl = httpcDownloadData(r->ctx, r->data + hi, want, &got);
         if (got > 0) {
