@@ -134,12 +134,42 @@ static void drawSeekBar(double posSec, double durSec) {
     printf("\x1b[29;5H[%s]", bar);
 }
 
-// Series name / episode title / year, each on its own line just above the seek
-// bar. Positioned with ANSI escapes; %.*s clamps to the console width.
+// Series name / episode title / year above the seek bar, one blank line between
+// each item. A long title wraps to a second line instead of being truncated.
+// The block is bottom-anchored so it always ends just above the seek bar.
 static void drawMeta(const std::string& series, const std::string& title, int year) {
-    if (!series.empty()) printf("\x1b[22;5H%.34s", series.c_str());
-    if (!title.empty())  printf("\x1b[23;5H%.34s", title.c_str());
-    if (year > 0)        printf("\x1b[24;5H%d", year);
+    const size_t W = 34;   // console text width (col 5 .. 38)
+
+    // Wrap the title into up to two lines.
+    std::string t1, t2;
+    if (title.size() <= W) {
+        t1 = title;
+    } else {
+        size_t len = W;
+        size_t sp  = title.rfind(' ', W);
+        if (sp != std::string::npos && sp > 0) len = sp;   // break on a space
+        t1 = title.substr(0, len);
+        size_t j = len;
+        while (j < title.size() && title[j] == ' ') j++;
+        t2 = title.substr(j);
+        if (t2.size() > W) t2 = t2.substr(0, W - 3) + "...";
+    }
+
+    int titleLines = title.empty() ? 0 : (t2.empty() ? 1 : 2);
+    int present    = (series.empty() ? 0 : 1) + (title.empty() ? 0 : 1) + (year > 0 ? 1 : 0);
+    int contentRows = (series.empty() ? 0 : 1) + titleLines + (year > 0 ? 1 : 0);
+    int total = contentRows + (present > 0 ? present - 1 : 0);   // + blank between items
+
+    int row = 25 - total + 1;   // last line lands on row 25 (blank row 26, bar at 27)
+    if (row < 1) row = 1;
+
+    if (!series.empty()) { printf("\x1b[%d;5H%.34s", row, series.c_str()); row += 2; }
+    if (!title.empty()) {
+        printf("\x1b[%d;5H%s", row, t1.c_str()); row++;
+        if (!t2.empty()) { printf("\x1b[%d;5H%s", row, t2.c_str()); row++; }
+        row++;   // blank line after the title
+    }
+    if (year > 0) printf("\x1b[%d;5H%d", row, year);
 }
 
 // ─── Blit 400x240 BGR565 -> 240x400 BGR8 and swap ────────────────────────────
