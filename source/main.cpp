@@ -118,6 +118,12 @@ int main() {
     httpcInit(0x1000);
     acInit();
 
+    // Run at the New 3DS clock (804 MHz) + L2 cache when available. Without this a
+    // New 3DS runs at the Old 3DS 268 MHz, throttling the CPU blit, demux, and the
+    // per-call HTTP copy — i.e. both decode smoothness and download throughput.
+    // No-op on an Old 3DS, so it's always safe to call.
+    osSetSpeedupEnable(true);
+
     // Ensure config directory exists
     mkdir("/3ds",       0777);
     mkdir("/3ds/3dsfin", 0777);
