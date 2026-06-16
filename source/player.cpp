@@ -15,6 +15,12 @@ static constexpr u32 FB_W  = 240, FB_H  = 400;
 // Actual coded dimensions (updated from SPS; default to the max until parsed).
 static u32 g_decW = VID_W, g_decH = VID_H;
 
+// On-screen debug overlay (bottom-screen console + green test paint). Hidden by
+// default; toggled during playback by holding X + D-Pad Up. File logging to
+// player_debug.txt is independent of this flag. DBG() prints only when enabled.
+static bool g_dbg = false;
+#define DBG(...) do { if (g_dbg) printf(__VA_ARGS__); } while (0)
+
 // ─── Buffer sizes ─────────────────────────────────────────────────────────────
 static constexpr u32 TS_SZ  = 188;
 static constexpr u32 RD_SZ  = TS_SZ * 128;
@@ -91,9 +97,9 @@ static void blitFrame(const u8* mvdOut, u32 frameCount) {
     const u16* src = (const u16*)mvdOut;
 
     if (frameCount < 3) {
-        printf("fb=%p px[0]=%04X dim=%lux%lu\n",
-               (void*)fb, (unsigned)src[0],
-               (unsigned long)g_decW, (unsigned long)g_decH);
+        DBG("fb=%p px[0]=%04X dim=%lux%lu\n",
+            (void*)fb, (unsigned)src[0],
+            (unsigned long)g_decW, (unsigned long)g_decH);
     }
 
     // Black out the screen first so a smaller-than-screen frame has no leftover
@@ -121,7 +127,8 @@ static void blitFrame(const u8* mvdOut, u32 frameCount) {
     gfxScreenSwapBuffers(GFX_TOP, false);
 }
 
-#define DLOG(dbg, ...) do { printf(__VA_ARGS__); if(dbg){fprintf(dbg,__VA_ARGS__);fflush(dbg);} } while(0)
+// Mirrors to the on-screen console (only when debug is enabled) and always to file.
+#define DLOG(dbg, ...) do { if (g_dbg) printf(__VA_ARGS__); if(dbg){fprintf(dbg,__VA_ARGS__);fflush(dbg);} } while(0)
 
 // Sentinel marker positions: 4 corners of the BGR565 output buffer, using the
 // CURRENT coded dimensions (g_decW/g_decH) so they match where MVD writes.
@@ -315,30 +322,25 @@ bool playerPlay(const std::string& url) {
     gfxExit();
     gfxInitDefault();
 
-    // Paint top screen solid green immediately to verify framebuffer writes work
+    // Clear the top screen before playback (both buffers). When debug is on it
+    // paints solid green as a framebuffer-path test; otherwise plain black.
     {
-        u8* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
-        for (u32 i = 0; i < FB_W * FB_H * 3; i += 3) {
-            fb[i]   = 0;    // B
-            fb[i+1] = 255;  // G
-            fb[i+2] = 0;    // R
+        u8 gch = g_dbg ? 255 : 0;  // green channel
+        for (int pass = 0; pass < 2; pass++) {
+            u8* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+            for (u32 i = 0; i < FB_W * FB_H * 3; i += 3) {
+                fb[i]   = 0; fb[i+1] = gch; fb[i+2] = 0;
+            }
+            GSPGPU_FlushDataCache(fb, FB_W * FB_H * 3);
+            gspWaitForVBlank();
+            gfxScreenSwapBuffers(GFX_TOP, false);
         }
-        GSPGPU_FlushDataCache(fb, FB_W * FB_H * 3);
-        gspWaitForVBlank();
-        gfxScreenSwapBuffers(GFX_TOP, false);
-        // Paint second buffer too (double-buffered display)
-        fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
-        for (u32 i = 0; i < FB_W * FB_H * 3; i += 3) {
-            fb[i]   = 0; fb[i+1] = 255; fb[i+2] = 0;
-        }
-        GSPGPU_FlushDataCache(fb, FB_W * FB_H * 3);
-        gspWaitForVBlank();
-        gfxScreenSwapBuffers(GFX_TOP, false);
     }
 
-    // Bottom-screen debug console (must come after gfxInitDefault)
+    // Bottom-screen console (must come after gfxInitDefault). Stays blank unless
+    // debug is toggled on with X + D-Pad Up.
     consoleInit(GFX_BOTTOM, NULL);
-    printf("playerPlay\n");
+    DBG("playerPlay\n");
 
     FILE* dbg = fopen("/3ds/3dsfin/player_debug.txt", "w");
     if (dbg) {
@@ -361,7 +363,7 @@ bool playerPlay(const std::string& url) {
         svcSleepThread(3000000000LL);
         return false;
     }
-    printf("Buffers OK\n");
+    DBG("Buffers OK\n");
 
     // Reset coded dims to the max so the first SPS always triggers reconfigure.
     g_decW = VID_W; g_decH = VID_H;
@@ -378,7 +380,7 @@ bool playerPlay(const std::string& url) {
         svcSleepThread(3000000000LL);
         return false;
     }
-    printf("MVD OK\n");
+    DBG("MVD OK\n");
 
     MVDSTD_Config mvdCfg;
     mvdstdGenerateDefaultConfig(&mvdCfg, VID_W, VID_H, VID_W, VID_H,
@@ -401,7 +403,7 @@ bool playerPlay(const std::string& url) {
     httpcContext ctx;
     bool    ok         = false;
     u32     httpStatus = 0;
-    printf("HTTP open...\n");
+    DBG("HTTP open...\n");
     if (R_SUCCEEDED(httpcOpenContext(&ctx, HTTPC_METHOD_GET, url.c_str(), 1))) {
         httpcAddRequestHeaderField(&ctx, "User-Agent", "3DSFin/0.1");
         if (R_SUCCEEDED(httpcBeginRequest(&ctx))) {
@@ -410,7 +412,7 @@ bool playerPlay(const std::string& url) {
         }
         if (!ok) httpcCloseContext(&ctx);
     }
-    printf("HTTP: %u\n", (unsigned)httpStatus);
+    DBG("HTTP: %u\n", (unsigned)httpStatus);
     if (dbg) { fprintf(dbg, "HTTP status: %u\n", (unsigned)httpStatus); fflush(dbg); }
 
     if (!ok) {
@@ -427,7 +429,7 @@ bool playerPlay(const std::string& url) {
         return false;
     }
 
-    printf("Streaming... B=stop\n");
+    DBG("Streaming... B=stop\n");
 
     // ─── Decode loop ─────────────────────────────────────────────────────────
     int  pmtPid    = -1;
@@ -441,9 +443,20 @@ bool playerPlay(const std::string& url) {
 
     u8  partial[TS_SZ];
     int partialLen = 0;
+    bool dbgComboPrev = false;   // edge-detect for the X + D-Pad Up debug toggle
 
     while (!stop) {
         hidScanInput();
+
+        // Toggle the on-screen debug overlay when X + D-Pad Up are held together.
+        bool dbgCombo = (hidKeysHeld() & KEY_X) && (hidKeysHeld() & KEY_DUP);
+        if (dbgCombo && !dbgComboPrev) {
+            g_dbg = !g_dbg;
+            if (g_dbg) printf("[debug ON]\n");
+            else       consoleClear();   // wipe the bottom screen when hiding
+        }
+        dbgComboPrev = dbgCombo;
+
         if (hidKeysDown() & KEY_B) break;
 
         u32    got   = 0;
@@ -466,13 +479,13 @@ bool playerPlay(const std::string& url) {
                     if (pid==0 && pay && pmtPid==-1) {
                         pmtPid = parsePAT(pay, psz);
                         if (pmtPid!=-1) {
-                            printf("PAT->pmtPid=%d\n", pmtPid);
+                            DBG("PAT->pmtPid=%d\n", pmtPid);
                             if (dbg) { fprintf(dbg,"PAT pmtPid=%d\n",pmtPid); fflush(dbg); }
                         }
                     } else if (pmtPid!=-1 && pid==pmtPid && pay && vidPid==-1) {
                         vidPid = parsePMT(pay, psz);
                         if (vidPid!=-1) {
-                            printf("PMT->vidPid=%d\n", vidPid);
+                            DBG("PMT->vidPid=%d\n", vidPid);
                             if (dbg) { fprintf(dbg,"PMT vidPid=%d\n",vidPid); fflush(dbg); }
                         }
                     } else if (vidPid!=-1 && pid==vidPid && pay) {
@@ -499,7 +512,7 @@ bool playerPlay(const std::string& url) {
             pktCount++;
             // Progress update every 500 packets
             if (pktCount % 500 == 0) {
-                printf("pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
+                DBG("pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
                 if (dbg) {
                     fprintf(dbg,"pkts=%u pmtPid=%d vidPid=%d frames=%u\n",
                             (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount);
@@ -516,13 +529,13 @@ bool playerPlay(const std::string& url) {
                 if (pid==0 && pay && pmtPid==-1) {
                     pmtPid = parsePAT(pay, psz);
                     if (pmtPid!=-1) {
-                        printf("PAT->pmtPid=%d\n", pmtPid);
+                        DBG("PAT->pmtPid=%d\n", pmtPid);
                         if (dbg) { fprintf(dbg,"PAT pmtPid=%d\n",pmtPid); fflush(dbg); }
                     }
                 } else if (pmtPid!=-1 && pid==pmtPid && pay && vidPid==-1) {
                     vidPid = parsePMT(pay, psz);
                     if (vidPid!=-1) {
-                        printf("PMT->vidPid=%d\n", vidPid);
+                        DBG("PMT->vidPid=%d\n", vidPid);
                         if (dbg) { fprintf(dbg,"PMT vidPid=%d\n",vidPid); fflush(dbg); }
                     }
                 } else if (vidPid!=-1 && pid==vidPid && pay) {
@@ -549,7 +562,7 @@ bool playerPlay(const std::string& url) {
         if (dlret != (Result)HTTPC_RESULTCODE_DOWNLOADPENDING) break;
     }
 
-    printf("End: pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
+    DBG("End: pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
     if (dbg) {
         fprintf(dbg,"End: pkts=%u pmtPid=%d vidPid=%d frames=%u\n",
                 (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount);
