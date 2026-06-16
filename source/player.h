@@ -3,5 +3,7 @@
 
 // Plays a Jellyfin MPEG-TS/H.264 stream using the New 3DS MVD hardware decoder.
 // Blocks until the stream ends or the user presses B.
+// runTimeTicks is the item's total duration (10,000,000 ticks/sec, 0 if unknown)
+// and drives the bottom-screen seek bar.
 // Returns false if MVD init fails (Old 3DS or allocation error).
-bool playerPlay(const std::string& url);
+bool playerPlay(const std::string& url, long long runTimeTicks = 0);

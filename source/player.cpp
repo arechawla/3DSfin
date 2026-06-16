@@ -87,6 +87,53 @@ static int pesHeaderLen(const u8* pay, int sz) {
     return 9 + pay[8];
 }
 
+// Extract the 90 kHz presentation timestamp from a PES header, or -1 if absent.
+static long long pesPTS(const u8* pay, int sz) {
+    if (sz < 14 || pay[0]!=0 || pay[1]!=0 || pay[2]!=1) return -1;
+    if (!(pay[7] & 0x80)) return -1;             // PTS_DTS_flags: no PTS present
+    return ((long long)((pay[9]  >> 1) & 0x07) << 30)
+         | ((long long) pay[10]               << 22)
+         | ((long long)((pay[11] >> 1) & 0x7F) << 15)
+         | ((long long) pay[12]               <<  7)
+         | ((long long)((pay[13] >> 1) & 0x7F));
+}
+
+// ─── Seek bar (bottom-screen text console) ───────────────────────────────────
+static void fmtTime(char* buf, size_t n, double sec) {
+    if (sec < 0) sec = 0;
+    int t = (int)(sec + 0.5);
+    int h = t / 3600, m = (t % 3600) / 60, s = t % 60;
+    if (h > 0) snprintf(buf, n, "%d:%02d:%02d", h, m, s);
+    else       snprintf(buf, n, "%02d:%02d", m, s);
+}
+
+// Draws "MM:SS / MM:SS" and a [####----] bar near the bottom of the console.
+// Uses ANSI cursor positioning so it updates in place (no scrolling).
+static void drawSeekBar(double posSec, double durSec) {
+    const int barW = 28;
+    char bar[barW + 1];
+    int filled = 0;
+    if (durSec > 0) {
+        double frac = posSec / durSec;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+        filled = (int)(frac * barW + 0.5);
+    }
+    for (int i = 0; i < barW; i++) bar[i] = (i < filled) ? '#' : '-';
+    bar[barW] = '\0';
+
+    char cur[16];
+    fmtTime(cur, sizeof(cur), posSec);
+    if (durSec > 0) {
+        char tot[16];
+        fmtTime(tot, sizeof(tot), durSec);
+        printf("\x1b[27;5H%s / %s    ", cur, tot);   // trailing spaces clear leftovers
+    } else {
+        printf("\x1b[27;5H%s    ", cur);             // unknown duration
+    }
+    printf("\x1b[29;5H[%s]", bar);
+}
+
 // ─── Blit 400x240 BGR565 -> 240x400 BGR8 and swap ────────────────────────────
 // 3DS top-screen layout: column-major, 240 rows per column.
 // Logical (x,y) -> physical offset = (x*240 + (239-y)) * 3
@@ -313,7 +360,7 @@ static void processH264(u8* pes, u32 pesLen,
 }
 
 // ─── Player entry point ───────────────────────────────────────────────────────
-bool playerPlay(const std::string& url) {
+bool playerPlay(const std::string& url, long long runTimeTicks) {
     // C2D_CreateScreenTarget replaced gfx's framebuffer pointers with its own VRAM
     // allocation. After C3D_Fini that VRAM is freed but the pointers stay stale.
     // gfxSetScreenFormat is a no-op when the format hasn't changed, so it doesn't
@@ -445,6 +492,12 @@ bool playerPlay(const std::string& url) {
     int partialLen = 0;
     bool dbgComboPrev = false;   // edge-detect for the X + D-Pad Up debug toggle
 
+    // Seek-bar state: position from PES PTS, total from the Jellyfin item.
+    double    durSec      = runTimeTicks > 0 ? runTimeTicks / 10000000.0 : 0.0;
+    double    posSec      = 0.0;
+    long long firstPts    = -1;          // PTS of the first frame (position origin)
+    int       lastShownSec = -1;         // throttle: redraw bar only when seconds change
+
     while (!stop) {
         hidScanInput();
 
@@ -453,7 +506,7 @@ bool playerPlay(const std::string& url) {
         if (dbgCombo && !dbgComboPrev) {
             g_dbg = !g_dbg;
             if (g_dbg) printf("[debug ON]\n");
-            else       consoleClear();   // wipe the bottom screen when hiding
+            else     { consoleClear(); lastShownSec = -1; }  // clear + force bar redraw
         }
         dbgComboPrev = dbgCombo;
 
@@ -490,6 +543,13 @@ bool playerPlay(const std::string& url) {
                         }
                     } else if (vidPid!=-1 && pid==vidPid && pay) {
                         if (pusi) {
+                            long long pts = pesPTS(pay, psz);
+                            if (pts >= 0) {
+                                if (firstPts < 0) firstPts = pts;
+                                long long d = pts - firstPts;
+                                if (d < 0) d += (1LL << 33);   // 33-bit PTS wraparound
+                                posSec = d / 90000.0;
+                            }
                             if (pesActive && pesLen > 0)
                                 processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg);
                             int skip = pesHeaderLen(pay,psz);
@@ -540,6 +600,13 @@ bool playerPlay(const std::string& url) {
                     }
                 } else if (vidPid!=-1 && pid==vidPid && pay) {
                     if (pusi) {
+                        long long pts = pesPTS(pay, psz);
+                        if (pts >= 0) {
+                            if (firstPts < 0) firstPts = pts;
+                            long long d = pts - firstPts;
+                            if (d < 0) d += (1LL << 33);   // 33-bit PTS wraparound
+                            posSec = d / 90000.0;
+                        }
                         if (pesActive && pesLen > 0)
                             processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg);
                         int skip = pesHeaderLen(pay,psz);
@@ -557,6 +624,13 @@ bool playerPlay(const std::string& url) {
         if (remaining > 0) {
             memcpy(partial, cur, remaining);
             partialLen = remaining;
+        }
+
+        // Refresh the seek bar once per second of playback (skip while the debug
+        // console is showing, so the two don't fight over the bottom screen).
+        if (!g_dbg && (int)posSec != lastShownSec) {
+            drawSeekBar(posSec, durSec);
+            lastShownSec = (int)posSec;
         }
 
         if (dlret != (Result)HTTPC_RESULTCODE_DOWNLOADPENDING) break;
