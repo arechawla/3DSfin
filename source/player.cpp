@@ -4,8 +4,16 @@
 #include <cstdio>
 
 // ─── Dimensions ──────────────────────────────────────────────────────────────
+// VID_W/VID_H are the MAX (output buffer is allocated for these). The actual
+// coded resolution is read from the H.264 SPS at runtime — Jellyfin preserves
+// aspect ratio under the MaxWidth/MaxHeight caps, so the real frame is often
+// shorter than 240 (e.g. 400x224 for 16:9). MVD must be configured with the
+// real coded dims or render() silently writes nothing.
 static constexpr u32 VID_W = 400, VID_H = 240;
 static constexpr u32 FB_W  = 240, FB_H  = 400;
+
+// Actual coded dimensions (updated from SPS; default to the max until parsed).
+static u32 g_decW = VID_W, g_decH = VID_H;
 
 // ─── Buffer sizes ─────────────────────────────────────────────────────────────
 static constexpr u32 TS_SZ  = 188;
@@ -83,13 +91,21 @@ static void blitFrame(const u8* mvdOut, u32 frameCount) {
     const u16* src = (const u16*)mvdOut;
 
     if (frameCount < 3) {
-        printf("fb=%p px[0]=%04X px[1k]=%04X\n",
-               (void*)fb, (unsigned)src[0], (unsigned)src[1000]);
+        printf("fb=%p px[0]=%04X dim=%lux%lu\n",
+               (void*)fb, (unsigned)src[0],
+               (unsigned long)g_decW, (unsigned long)g_decH);
     }
 
-    for (u32 y = 0; y < VID_H; y++) {
-        for (u32 x = 0; x < VID_W; x++) {
-            u16 px  = src[y * VID_W + x];
+    // Black out the screen first so a smaller-than-screen frame has no leftover
+    // (e.g. the green test paint) in the letterbox margin.
+    memset(fb, 0, FB_W * FB_H * 3);
+
+    // Source stride is the coded width (g_decW); clamp to screen bounds.
+    u32 maxY = (g_decH < FB_W) ? g_decH : FB_W;   // y maps to screen X (240 wide)
+    u32 maxX = (g_decW < FB_H) ? g_decW : FB_H;   // x maps to screen Y (400 tall)
+    for (u32 y = 0; y < maxY; y++) {
+        for (u32 x = 0; x < maxX; x++) {
+            u16 px  = src[y * g_decW + x];
             u8  r5  = (px >> 11) & 0x1F;
             u8  g6  = (px >> 5)  & 0x3F;
             u8  b5  =  px        & 0x1F;
@@ -105,75 +121,187 @@ static void blitFrame(const u8* mvdOut, u32 frameCount) {
     gfxScreenSwapBuffers(GFX_TOP, false);
 }
 
-// ─── NAL unit scanner ─────────────────────────────────────────────────────────
-static void processH264(const u8* data, u32 len,
-                        u8* nalBuf, u8* mvdOut,
-                        MVDSTD_Config* cfg, bool* stop, u32* frameCount) {
-    static u32  nalCount = 0;
-    static bool inited   = false;
-    if (!inited) {
-        inited = true;
-        // Print the actual values of MVD status constants so we know what to expect
-        printf("FRAMEREADY=%08lX\n", (unsigned long)MVD_STATUS_FRAMEREADY);
-        printf("PARAMSET  =%08lX\n", (unsigned long)MVD_STATUS_PARAMSET);
-        // Sentinel-fill mvdOut: if pixels stay 0xAAAA after render, MVD never wrote here
-        memset(mvdOut, 0xAA, VID_W * VID_H * 2);
-        GSPGPU_FlushDataCache(mvdOut, VID_W * VID_H * 2);
-        printf("sentinel filled\n");
-    }
+#define DLOG(dbg, ...) do { printf(__VA_ARGS__); if(dbg){fprintf(dbg,__VA_ARGS__);fflush(dbg);} } while(0)
 
+// Sentinel marker positions: 4 corners of the BGR565 output buffer, using the
+// CURRENT coded dimensions (g_decW/g_decH) so they match where MVD writes.
+// MVD overwrites these when it actually decodes a frame; if they survive a
+// process/render call, no frame was produced. (0x11 per reference impl.)
+static inline void mvdSetSentinels(u8* buf) {
+    u32 sz = g_decW * g_decH * 2;
+    buf[0]              = 0x11;
+    buf[g_decW*2 - 1]   = 0x11;
+    buf[sz - g_decW*2]  = 0x11;
+    buf[sz - 1]         = 0x11;
+}
+static inline bool mvdSentinelsChanged(const u8* buf) {
+    u32 sz = g_decW * g_decH * 2;
+    return buf[0]              != 0x11 ||
+           buf[g_decW*2 - 1]   != 0x11 ||
+           buf[sz - g_decW*2]  != 0x11 ||
+           buf[sz - 1]         != 0x11;
+}
+
+// ─── Minimal H.264 SPS parser (coded resolution only) ────────────────────────
+struct BitReader { const u8* d; u32 nbits; u32 pos; };
+static u32 brU1(BitReader* b) {
+    if (b->pos >= b->nbits) return 0;
+    u32 v = (b->d[b->pos >> 3] >> (7 - (b->pos & 7))) & 1; b->pos++; return v;
+}
+static u32 brUn(BitReader* b, int n) { u32 v = 0; while (n-- > 0) v = (v << 1) | brU1(b); return v; }
+static u32 brUE(BitReader* b) {
+    int z = 0; while (b->pos < b->nbits && brU1(b) == 0 && z < 31) z++;
+    return ((1u << z) - 1) + brUn(b, z);
+}
+static int brSE(BitReader* b) { u32 k = brUE(b); return (k & 1) ? (int)((k + 1) >> 1) : -(int)(k >> 1); }
+
+// Parse coded width/height from an SPS NAL (payload starts at the NAL header byte).
+static bool parseSPS(const u8* nal, u32 len, u32* outW, u32* outH) {
+    u8 rbsp[96]; u32 r = 0;
+    for (u32 i = 1; i < len && r < sizeof(rbsp); i++) {     // skip NAL header byte
+        if (i >= 2 && nal[i] == 3 && nal[i-1] == 0 && nal[i-2] == 0) continue; // emu prevention
+        rbsp[r++] = nal[i];
+    }
+    BitReader b = { rbsp, r * 8, 0 };
+    u32 profile = brUn(&b, 8); brUn(&b, 8); brUn(&b, 8);    // profile / constraints / level
+    brUE(&b);                                                // seq_parameter_set_id
+    if (profile==100||profile==110||profile==122||profile==244||profile==44||
+        profile==83||profile==86||profile==118||profile==128||profile==138||
+        profile==139||profile==134||profile==135) {
+        u32 chroma = brUE(&b);
+        if (chroma == 3) brU1(&b);
+        brUE(&b); brUE(&b); brU1(&b);                        // bit depths + qpprime
+        if (brU1(&b)) {                                      // scaling matrix present
+            int cnt = (chroma != 3) ? 8 : 12;
+            for (int i = 0; i < cnt; i++)
+                if (brU1(&b)) {                              // list present → skip it
+                    int sz = (i < 6) ? 16 : 64, last = 8, next = 8;
+                    for (int j = 0; j < sz; j++) {
+                        if (next != 0) { int d = brSE(&b); next = (last + d + 256) & 255; }
+                        last = (next == 0) ? last : next;
+                    }
+                }
+        }
+    }
+    brUE(&b);                                                // log2_max_frame_num
+    u32 poc = brUE(&b);
+    if (poc == 0) brUE(&b);
+    else if (poc == 1) {
+        brU1(&b); brSE(&b); brSE(&b);
+        u32 n = brUE(&b); for (u32 i = 0; i < n; i++) brSE(&b);
+    }
+    brUE(&b); brU1(&b);                                      // max_num_ref_frames + gaps flag
+    u32 wMbs = brUE(&b), hMaps = brUE(&b);
+    u32 frameMbsOnly = brU1(&b);
+    u32 w = (wMbs + 1) * 16;
+    u32 h = (hMaps + 1) * 16 * (2 - frameMbsOnly);
+    if (w == 0 || h == 0 || w > 1024 || h > 1024) return false;
+    *outW = w; *outH = h; return true;
+}
+
+// ─── Access-unit H.264 decoder ───────────────────────────────────────────────
+// Faithful adaptation of Core-2-Extreme/Video_player_for_3DS Util_decoder_mvd_decode,
+// for an Annex-B MPEG-TS source instead of FFmpeg/AVCC:
+//   1. Rebuild the access unit dropping AUD(9)/filler(12) NALs that MVD chokes on.
+//   2. Re-arm the output buffer with MVDSTD_SetConfig() *before every frame*.
+//   3. Feed the whole access unit in one mvdstdProcessVideoFrame() call.
+//      The first AU is fed twice: pass 1 registers SPS/PPS, pass 2 decodes the IDR.
+//   4. The frame is usually written during process(); check sentinels first and
+//      only fall back to polling mvdstdRenderVideoFrame() if nothing appeared.
+static void processH264(u8* pes, u32 pesLen,
+                        u8* feedBuf, u8* mvdOut,
+                        MVDSTD_Config* cfg, bool* first,
+                        bool* stop, u32* frameCount, FILE* dbg) {
+    (void)first;
+    static u32 auCount = 0;
+    auCount++;
+    bool log = (auCount <= 25 || *frameCount < 5);
+    u32 bufSz = g_decW * g_decH * 2;
+
+    // Feed ONE NAL per mvdstdProcessVideoFrame call (the reference never lumps
+    // SPS/PPS/slice together): SPS(7)/PPS(8)→PARAMSET, VCL slice(1..5)→FRAMEREADY→render.
     u32 pos = 0;
-    while (!*stop && pos + 3 < len) {
-        bool sc3 = data[pos]==0 && data[pos+1]==0 && data[pos+2]==1;
-        bool sc4 = !sc3 && pos+3 < len &&
-                   data[pos]==0 && data[pos+1]==0 &&
-                   data[pos+2]==0 && data[pos+3]==1;
+    while (pos + 3 < pesLen && !*stop) {
+        bool sc3 = pes[pos]==0 && pes[pos+1]==0 && pes[pos+2]==1;
+        bool sc4 = !sc3 && pes[pos]==0 && pes[pos+1]==0 &&
+                   pes[pos+2]==0 && pes[pos+3]==1;
         if (!sc3 && !sc4) { pos++; continue; }
 
-        u32 nalStart = sc4 ? pos+1 : pos;
-        u32 scanFrom = pos + (sc4 ? 4 : 3) + 1;
-
-        u32 nalEnd = len;
-        for (u32 s = scanFrom; s+2 < len; s++) {
-            if (data[s]==0 && data[s+1]==0 &&
-                (data[s+2]==1 || (s+3<len && data[s+2]==0 && data[s+3]==1))) {
+        u32 scLen   = sc4 ? 4 : 3;
+        u32 payload = pos + scLen;           // first byte after start code
+        u32 nalEnd  = pesLen;
+        for (u32 s = payload + 1; s + 2 < pesLen; s++) {
+            if (pes[s]==0 && pes[s+1]==0 &&
+                (pes[s+2]==1 || (s+3<pesLen && pes[s+2]==0 && pes[s+3]==1))) {
                 nalEnd = s; break;
             }
         }
+        u8  nalType  = pes[payload] & 0x1F;
+        u32 nalBytes = nalEnd - payload;     // NAL payload (no start code)
+        pos = nalEnd;
 
-        u32 nalSize = nalEnd - nalStart;
-        if (nalSize > 0 && nalSize <= NAL_SZ) {
-            memcpy(nalBuf, data + nalStart, nalSize);
-            GSPGPU_FlushDataCache(nalBuf, nalSize);
+        if (nalBytes == 0 || nalType == 9 || nalType == 12) continue;  // skip AUD/filler
+        if (3 + nalBytes > NAL_SZ) continue;
 
-            nalCount++;
-            // NAL type sits in the first byte after the 3-byte start code (00 00 01)
-            u8 nalType = (nalSize >= 4) ? (nalBuf[3] & 0x1F) : 0;
-            bool log   = (nalCount <= 20);
-
-            MVDSTD_ProcessNALUnitOut out;
-            Result ret = mvdstdProcessVideoFrame(nalBuf, nalSize, 0, &out);
-            if (log) printf("NAL#%u t=%u sz=%u ret=%08lX\n",
-                            (unsigned)nalCount, (unsigned)nalType,
-                            (unsigned)nalSize,  (unsigned long)ret);
-
-            if (ret == MVD_STATUS_FRAMEREADY) {
-                Result rr = mvdstdRenderVideoFrame(cfg, true);
-                const u16* dp = (const u16*)mvdOut;
-                u16 pre0  = dp[0];
-                GSPGPU_InvalidateDataCache(mvdOut, VID_W * VID_H * 2);
-                u16 post0 = dp[0];
-                if (log || *frameCount < 3)
-                    printf("  rend=%08lX pre=%04X post=%04X\n",
-                           (unsigned long)rr, (unsigned)pre0, (unsigned)post0);
-                blitFrame(mvdOut, *frameCount);
-                (*frameCount)++;
-                if (*frameCount <= 5) printf("frame %u\n", (unsigned)*frameCount);
-                hidScanInput();
-                if (hidKeysDown() & KEY_B) *stop = true;
+        // SPS: parse the real coded resolution and reconfigure MVD if it changed.
+        // MVD render() writes nothing unless the config dims match the decoded frame.
+        if (nalType == 7) {
+            u32 w, h;
+            if (parseSPS(pes + payload, nalBytes, &w, &h) &&
+                (w != g_decW || h != g_decH)) {
+                g_decW = w; g_decH = h;
+                bufSz  = g_decW * g_decH * 2;
+                mvdstdGenerateDefaultConfig(cfg, g_decW, g_decH, g_decW, g_decH,
+                                            nullptr, nullptr, nullptr);
+                cfg->physaddr_outdata0 = osConvertVirtToPhys(mvdOut);
+                cfg->physaddr_outdata1 = osConvertVirtToPhys(mvdOut);
+                DLOG(dbg, "SPS dims=%lux%lu (reconfigured MVD)\n",
+                     (unsigned long)g_decW, (unsigned long)g_decH);
             }
         }
-        pos = nalEnd;
+
+        // Build a single Annex-B NAL (00 00 01 + payload) in linear feedBuf
+        feedBuf[0]=0; feedBuf[1]=0; feedBuf[2]=1;
+        memcpy(feedBuf + 3, pes + payload, nalBytes);
+        u32 feedLen = 3 + nalBytes;
+        GSPGPU_FlushDataCache(feedBuf, feedLen);
+
+        bool isVCL = (nalType >= 1 && nalType <= 5);
+
+        if (isVCL) {                         // arm output buffer just before a frame NAL
+            mvdSetSentinels(mvdOut);
+            GSPGPU_FlushDataCache(mvdOut, bufSz);
+            MVDSTD_SetConfig(cfg);
+        }
+
+        Result rp = mvdstdProcessVideoFrame(feedBuf, feedLen, 0, nullptr);
+        if (rp == (Result)MVD_STATUS_INCOMPLETEPROCESSING)   // retry once
+            rp = mvdstdProcessVideoFrame(feedBuf, feedLen, 0, nullptr);
+
+        if (log) DLOG(dbg, "NAL t=%u sz=%u proc=%08lX\n",
+                     (unsigned)nalType, (unsigned)nalBytes, (unsigned long)rp);
+
+        if (!isVCL) continue;                // parameter sets / SEI: no frame to render
+
+        // Render the decoded frame into mvdOut (NULL = no re-SetConfig, patched mvd.c)
+        bool got = false;
+        Result rr = (Result)MVD_STATUS_BUSY;
+        for (int i = 0; i < 256; i++) {
+            rr = mvdstdRenderVideoFrame(nullptr, false);
+            GSPGPU_InvalidateDataCache(mvdOut, bufSz);
+            if (mvdSentinelsChanged(mvdOut)) { got = true; break; }
+            if (rr != (Result)MVD_STATUS_BUSY) break;
+        }
+        if (log) DLOG(dbg, " rend=%08lX got=%d px=%02X%02X\n",
+                     (unsigned long)rr, (int)got, mvdOut[0], mvdOut[1]);
+
+        if (got) {
+            blitFrame(mvdOut, *frameCount);
+            (*frameCount)++;
+            if (*frameCount <= 5) DLOG(dbg, "frame %u\n", (unsigned)*frameCount);
+        }
+        hidScanInput();
+        if (hidKeysDown() & KEY_B) { *stop = true; return; }
     }
 }
 
@@ -187,12 +315,37 @@ bool playerPlay(const std::string& url) {
     gfxExit();
     gfxInitDefault();
 
+    // Paint top screen solid green immediately to verify framebuffer writes work
+    {
+        u8* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+        for (u32 i = 0; i < FB_W * FB_H * 3; i += 3) {
+            fb[i]   = 0;    // B
+            fb[i+1] = 255;  // G
+            fb[i+2] = 0;    // R
+        }
+        GSPGPU_FlushDataCache(fb, FB_W * FB_H * 3);
+        gspWaitForVBlank();
+        gfxScreenSwapBuffers(GFX_TOP, false);
+        // Paint second buffer too (double-buffered display)
+        fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+        for (u32 i = 0; i < FB_W * FB_H * 3; i += 3) {
+            fb[i]   = 0; fb[i+1] = 255; fb[i+2] = 0;
+        }
+        GSPGPU_FlushDataCache(fb, FB_W * FB_H * 3);
+        gspWaitForVBlank();
+        gfxScreenSwapBuffers(GFX_TOP, false);
+    }
+
     // Bottom-screen debug console (must come after gfxInitDefault)
     consoleInit(GFX_BOTTOM, NULL);
     printf("playerPlay\n");
 
     FILE* dbg = fopen("/3ds/3dsfin/player_debug.txt", "w");
-    if (dbg) { fprintf(dbg, "URL: %s\n\n", url.c_str()); fflush(dbg); }
+    if (dbg) {
+        fprintf(dbg, "BUILD=sps-dims-3\n");
+        fprintf(dbg, "URL: %s\n\n", url.c_str());
+        fflush(dbg);
+    }
 
     // Linear memory buffers
     u8* rdBuf  = (u8*)linearAlloc(RD_SZ);
@@ -210,6 +363,9 @@ bool playerPlay(const std::string& url) {
     }
     printf("Buffers OK\n");
 
+    // Reset coded dims to the max so the first SPS always triggers reconfigure.
+    g_decW = VID_W; g_decH = VID_H;
+
     // Init MVD hardware decoder
     Result mvdRet = mvdstdInit(MVDMODE_VIDEOPROCESSING,
                                MVD_INPUT_H264, MVD_OUTPUT_BGR565,
@@ -226,10 +382,20 @@ bool playerPlay(const std::string& url) {
 
     MVDSTD_Config mvdCfg;
     mvdstdGenerateDefaultConfig(&mvdCfg, VID_W, VID_H, VID_W, VID_H,
-                                nullptr, (u32*)mvdOut, (u32*)mvdOut);
-    printf("mvdOut virt=%08lX\n",    (unsigned long)mvdOut);
-    printf("       phys=%08lX\n",    (unsigned long)osConvertVirtToPhys(mvdOut));
-    printf("cfg physaddr=%08lX\n",   (unsigned long)mvdCfg.physaddr_outdata0);
+                                nullptr, nullptr, nullptr);
+    mvdCfg.physaddr_outdata0 = osConvertVirtToPhys(mvdOut);
+    mvdCfg.physaddr_outdata1 = osConvertVirtToPhys(mvdOut);
+    MVDSTD_SetConfig(&mvdCfg);
+    DLOG(dbg, "mvdOut virt=%08lX phys=%08lX\n",
+         (unsigned long)mvdOut,
+         (unsigned long)mvdCfg.physaddr_outdata0);
+
+    // Override probe: stock libctru returns -1 (FFFFFFFF) for a NULL config;
+    // our vendored/patched mvd.c allows NULL. This single line proves which
+    // mvd.c is actually linked into the running binary.
+    Result nullProbe = mvdstdRenderVideoFrame(nullptr, false);
+    DLOG(dbg, "NULLrender probe=%08lX (FFFFFFFF=stock libctru, else=patched mvd.c)\n",
+         (unsigned long)nullProbe);
 
     // Open HTTP stream
     httpcContext ctx;
@@ -268,7 +434,8 @@ bool playerPlay(const std::string& url) {
     int  vidPid    = -1;
     u32  pesLen    = 0;
     bool pesActive = false;
-    bool stop      = false;
+    bool stop       = false;
+    bool mvdFirst   = true;   // first access unit is fed twice (params, then decode)
     u32  frameCount = 0;
     u32  pktCount   = 0;
 
@@ -311,7 +478,7 @@ bool playerPlay(const std::string& url) {
                     } else if (vidPid!=-1 && pid==vidPid && pay) {
                         if (pusi) {
                             if (pesActive && pesLen > 0)
-                                processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&stop,&frameCount);
+                                processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg);
                             int skip = pesHeaderLen(pay,psz);
                             pesLen = 0; pesActive = true;
                             int cp = psz-skip;
@@ -361,7 +528,7 @@ bool playerPlay(const std::string& url) {
                 } else if (vidPid!=-1 && pid==vidPid && pay) {
                     if (pusi) {
                         if (pesActive && pesLen > 0)
-                            processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&stop,&frameCount);
+                            processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg);
                         int skip = pesHeaderLen(pay,psz);
                         pesLen = 0; pesActive = true;
                         int cp = psz-skip;
