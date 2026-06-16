@@ -268,11 +268,13 @@ std::string JellyfinClient::getStreamUrl(const std::string& itemId) const {
              "&AudioCodec=aac"
              // Bitrate must stay UNDER sustained 3DS Wi-Fi throughput or the ring
              // buffer drains faster than it fills and playback buffers every few
-             // seconds. 0.6 Mbps is plenty for 400x224. Raise/lower to taste.
-             "&VideoBitrate=600000"
-             // Cap fps: a 60fps source otherwise doubles the data and the blit
-             // CPU load (which competes with the download thread for core 0).
-             "&MaxFramerate=30"
+             // seconds. 0.4 Mbps for headroom on a marginal link; still fine for
+             // 400x224. Raise/lower to taste.
+             "&VideoBitrate=400000"
+             // Cap fps at 24. With VideoBitrate capped this doesn't cut bandwidth,
+             // but at a low bitrate it gives each frame ~25% more bits (cleaner
+             // image) and trims blit CPU on core 0 (more time for the downloader).
+             "&MaxFramerate=24"
              "&MaxWidth=400"
              "&MaxHeight=240"
              "&SubtitleMethod=None"

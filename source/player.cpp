@@ -257,7 +257,7 @@ static void paceToPts(long long auPts) {
 // socket starving — which is what previously caused the stutter (a single thread
 // can't both pace display AND keep reading). RING_SZ is a power of two so the
 // free-running u32 head/tail counters wrap cleanly; index = pos & RING_MASK.
-static constexpr u32 RING_SZ   = 4u * 1024 * 1024;   // ~50 s at 0.6 Mbps
+static constexpr u32 RING_SZ   = 8u * 1024 * 1024;   // ~1.8 min at 0.6 Mbps
 static constexpr u32 RING_MASK = RING_SZ - 1;
 static constexpr u32 PREBUF_SZ = 512u * 1024;        // fill this much before playing
 static constexpr u32 DL_CHUNK  = 128u * 1024;        // bytes per httpcDownloadData call
