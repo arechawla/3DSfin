@@ -240,6 +240,16 @@ std::vector<JellyfinItem> JellyfinClient::getItems(const std::string& parentId,
     return result;
 }
 
+std::string JellyfinClient::getPrimaryImage(const std::string& itemId, int fillWidth) {
+    char path[256];
+    snprintf(path, sizeof(path),
+             "/Items/%s/Images/Primary?fillWidth=%d&format=Jpg&quality=85",
+             itemId.c_str(), fillWidth);
+    auto resp = http_.get(path);
+    if (!resp.ok()) return "";   // 404 = library has no Primary image
+    return resp.body;            // raw JPEG bytes (binary-safe)
+}
+
 std::string JellyfinClient::getStreamUrl(const std::string& itemId) const {
     // Ask Jellyfin to transcode to H.264/AAC at 3DS-friendly resolution.
     // Phase 2: feed this URL to the MVD hardware decoder.

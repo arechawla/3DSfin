@@ -37,6 +37,10 @@ public:
     // Returns a direct-stream URL pre-configured for 3DS capabilities
     std::string getStreamUrl(const std::string& itemId) const;
 
+    // Fetches the raw Primary-image bytes (JPEG) for an item/library, scaled to
+    // fillWidth px. Returns an empty string if the item has no image or on error.
+    std::string getPrimaryImage(const std::string& itemId, int fillWidth);
+
     bool        isAuthenticated() const { return !accessToken_.empty(); }
     std::string serverUrl()       const { return serverUrl_; }
     int         lastStatus()      const { return lastStatus_; }

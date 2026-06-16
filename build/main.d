@@ -111,7 +111,8 @@ main.o: C:/devkitPro/3dsfin/source/main.cpp \
  C:/devkitPro/libctru/include/c2d/text.h \
  C:/devkitPro/libctru/include/c2d/font.h \
  C:/devkitPro/3dsfin/source/jellyfin.h C:/devkitPro/3dsfin/source/http.h \
- C:/devkitPro/3dsfin/source/ui.h C:/devkitPro/3dsfin/source/player.h
+ C:/devkitPro/3dsfin/source/ui.h C:/devkitPro/3dsfin/source/player.h \
+ C:/devkitPro/3dsfin/source/image.h
 C:/devkitPro/libctru/include/3ds.h:
 C:/devkitPro/libctru/include/3ds/types.h:
 C:/devkitPro/libctru/include/3ds/result.h:
@@ -227,3 +228,4 @@ C:/devkitPro/3dsfin/source/jellyfin.h:
 C:/devkitPro/3dsfin/source/http.h:
 C:/devkitPro/3dsfin/source/ui.h:
 C:/devkitPro/3dsfin/source/player.h:
+C:/devkitPro/3dsfin/source/image.h:

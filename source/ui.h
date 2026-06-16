@@ -13,6 +13,10 @@ public:
     static constexpr int BOT_W         = 320;
     static constexpr int BOT_H         = 240;
 
+    // Library home-screen grid (2-wide landscape cards)
+    static constexpr int GRID_COLS         = 2;
+    static constexpr int GRID_ROWS_VISIBLE = 2;
+
     UI(C3D_RenderTarget* top, C3D_RenderTarget* bot);
     ~UI();
 
@@ -24,7 +28,10 @@ public:
     void drawLoadingScreen(const std::string& msg);
     void drawErrorScreen(const std::string& msg);
 
-    void drawLibraryList(const std::vector<JellyfinLibrary>& libs,
+    // Grid of library cover-art cards. covers is parallel to libs; a card whose
+    // covers[i].tex is null falls back to a colored placeholder.
+    void drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
+                         const std::vector<C2D_Image>& covers,
                          int selected, int offset);
 
     void drawItemList(const std::vector<JellyfinItem>& items,

@@ -174,24 +174,80 @@ void UI::drawErrorScreen(const std::string& msg) {
     drawBottomHints("A/B: Back to login");
 }
 
-void UI::drawLibraryList(const std::vector<JellyfinLibrary>& libs,
-                         int selected, int offset) {
-    std::vector<std::string> rows;
-    for (auto& l : libs) {
-        std::string label = l.name;
-        if (!l.collectionType.empty()) label += "  [" + l.collectionType + "]";
-        rows.push_back(label);
-    }
-    if (rows.empty()) rows.push_back("(no libraries found)");
+// Placeholder card color, keyed off the library's collection type.
+static u32 placeholderColor(const std::string& type) {
+    if (type == "movies")   return C2D_Color32(0x2e, 0x4b, 0x8c, 0xFF); // blue
+    if (type == "tvshows")  return C2D_Color32(0x6b, 0x2e, 0x8c, 0xFF); // purple
+    if (type == "music")    return C2D_Color32(0x2e, 0x8c, 0x5a, 0xFF); // green
+    if (type == "books")    return C2D_Color32(0x8c, 0x6b, 0x2e, 0xFF); // amber
+    if (type == "homevideos" || type == "photos")
+                            return C2D_Color32(0x8c, 0x2e, 0x4b, 0xFF); // rose
+    return C2D_Color32(0x3a, 0x3a, 0x52, 0xFF);                         // neutral
+}
 
+void UI::drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
+                         const std::vector<C2D_Image>& covers,
+                         int selected, int offset) {
     C2D_SceneBegin(top_);
     drawTopBar("Libraries");
-    drawScrollList(rows, selected, offset);
+
+    const int   cols   = GRID_COLS;
+    const int   rowsV  = GRID_ROWS_VISIBLE;
+    const float mx     = 10.0f;   // left/right margin
+    const float my     = 30.0f;   // top of grid (below the bar)
+    const float gap    = 10.0f;   // gap between cards
+    const float cardW  = (TOP_W - 2 * mx - (cols - 1) * gap) / cols;  // ~185
+    const float cardH  = 92.0f;
+    const float pitchY = cardH + 12.0f;
+
+    if (libs.empty()) {
+        drawText("(no libraries found)", 8, 110, 0.50f, COL_GREY);
+    }
+
+    for (int i = 0; i < cols * rowsV; i++) {
+        int idx = offset * cols + i;
+        if (idx >= (int)libs.size()) break;
+
+        int   c = i % cols, r = i / cols;
+        float x = mx + c * (cardW + gap);
+        float y = my + r * pitchY;
+        bool  sel = (idx == selected);
+
+        if (sel) drawRect(x - 3, y - 3, cardW + 6, cardH + 6, COL_SEL);
+
+        bool hasImg = (idx < (int)covers.size() && covers[idx].tex != nullptr);
+        if (hasImg) {
+            const C2D_Image& im = covers[idx];
+            float sx = cardW / (float)im.subtex->width;
+            float sy = cardH / (float)im.subtex->height;
+            C2D_DrawImageAt(im, x, y, 0.0f, nullptr, sx, sy);
+        } else {
+            drawRect(x, y, cardW, cardH, placeholderColor(libs[idx].collectionType));
+        }
+
+        // Name strip across the bottom of the card.
+        drawRect(x, y + cardH - 22, cardW, 22, C2D_Color32(0, 0, 0, 0xB0));
+        drawTextBuf(libs[idx].name, x + 6, y + cardH - 19, 0.46f, COL_WHITE, cardW - 12);
+    }
+
+    // Scrollbar when there are more rows than fit.
+    int totalRows = ((int)libs.size() + cols - 1) / cols;
+    if (totalRows > rowsV) {
+        float barH   = TOP_H - 26;
+        float thumbH = barH * rowsV / totalRows;
+        float thumbY = 26 + barH * offset / totalRows;
+        drawRect(TOP_W - 4, 26,     4, barH,   COL_ROW_ALT);
+        drawRect(TOP_W - 4, thumbY, 4, thumbH, COL_GREY);
+    }
 
     C2D_SceneBegin(bot_);
     drawRect(0, 0, BOT_W, BOT_H, COL_BG_BOT);
-    drawText("Select a library to browse", 8, 80, 0.50f, COL_GREY);
-    drawBottomHints("A: Open   UP/DOWN: Navigate   START: Quit");
+    if (selected >= 0 && selected < (int)libs.size()) {
+        drawText(truncate(libs[selected].name, 28), 8, 30, 0.58f, COL_WHITE);
+        if (!libs[selected].collectionType.empty())
+            drawText(libs[selected].collectionType, 8, 60, 0.46f, COL_GREY);
+    }
+    drawBottomHints("A: Open   D-Pad: Move   START: Quit");
 }
 
 void UI::drawItemList(const std::vector<JellyfinItem>& items,

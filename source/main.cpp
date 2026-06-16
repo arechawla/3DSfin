@@ -6,6 +6,7 @@
 #include "jellyfin.h"
 #include "ui.h"
 #include "player.h"
+#include "image.h"
 
 // ---- App state -------------------------------------------------------------
 
@@ -35,8 +36,35 @@ static std::string loadMsg;
 static std::string errorMsg;
 
 static std::vector<JellyfinLibrary> libraries;
+static std::vector<C2D_Image>       libCovers;     // GPU textures, parallel to libraries
+static std::vector<std::string>     libCoverData;  // raw JPEG bytes cache (survives C3D_Fini)
 static std::vector<JellyfinItem>    items;
 static int selLib  = 0, libOffset  = 0;
+
+static void freeLibCovers() {
+    for (auto& im : libCovers) Image_free(&im);
+    libCovers.clear();
+}
+
+// (Re)build cover textures from the cached JPEG bytes — no network. Called after
+// playback tears down and re-creates the GPU context.
+static void buildCoverTextures() {
+    freeLibCovers();
+    libCovers.assign(libraries.size(), C2D_Image{});
+    for (size_t i = 0; i < libCoverData.size() && i < libCovers.size(); i++)
+        if (!libCoverData[i].empty())
+            Image_loadFromMemory(
+                reinterpret_cast<const unsigned char*>(libCoverData[i].data()),
+                libCoverData[i].size(), &libCovers[i]);
+}
+
+// Fetch each library's cover art over the network into the cache, then build textures.
+static void fetchLibCovers() {
+    libCoverData.assign(libraries.size(), std::string());
+    for (size_t i = 0; i < libraries.size(); i++)
+        libCoverData[i] = client.getPrimaryImage(libraries[i].id, 256);
+    buildCoverTextures();
+}
 static int selItem = 0, itemOffset = 0;
 static std::string playerUrl;
 static std::string pendingUsername;
@@ -154,6 +182,7 @@ int main() {
                     libraries  = client.getLibraries();
                     selLib     = 0;
                     libOffset  = 0;
+                    fetchLibCovers();   // network: cache JPEGs + build textures
                     state      = STATE_LIBRARIES;
                     break;
 
@@ -199,21 +228,26 @@ int main() {
                 }
                 break;
 
-            case STATE_LIBRARIES:
-                if (kDown & KEY_DOWN && selLib < (int)libraries.size() - 1) {
-                    selLib++;
-                    if (selLib >= libOffset + UI::VISIBLE_ROWS) libOffset++;
-                }
-                if (kDown & KEY_UP && selLib > 0) {
-                    selLib--;
-                    if (selLib < libOffset) libOffset--;
-                }
+            case STATE_LIBRARIES: {
+                int n    = (int)libraries.size();
+                int cols = UI::GRID_COLS;
+                if (kDown & KEY_RIGHT && selLib < n - 1 && (selLib % cols) != cols - 1) selLib++;
+                if (kDown & KEY_LEFT  && (selLib % cols) != 0)                          selLib--;
+                if (kDown & KEY_DOWN  && selLib + cols < n)                             selLib += cols;
+                if (kDown & KEY_UP    && selLib - cols >= 0)                            selLib -= cols;
+                // Scroll so the selected row stays visible (libOffset is in rows).
+                int selRow = selLib / cols;
+                if (selRow < libOffset) libOffset = selRow;
+                if (selRow >= libOffset + UI::GRID_ROWS_VISIBLE)
+                    libOffset = selRow - UI::GRID_ROWS_VISIBLE + 1;
+
                 if (kDown & KEY_A && !libraries.empty()) {
                     loadMsg = "Loading \"" + libraries[selLib].name + "\"...";
                     pending = LOAD_ITEMS;
                     state   = STATE_LOADING;
                 }
                 break;
+            }
 
             case STATE_ITEMS:
                 if (kDown & KEY_B) { state = STATE_LIBRARIES; break; }
@@ -232,6 +266,7 @@ int main() {
                 break;
 
             case STATE_PLAYER: {
+                freeLibCovers();   // textures live in VRAM that playback tears down
                 C2D_Fini();
                 C3D_Fini();
 
@@ -244,6 +279,7 @@ int main() {
                 botScreen = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
                 ui.~UI();
                 new (&ui) UI(topScreen, botScreen);
+                buildCoverTextures();   // rebuild from cached JPEG bytes (no re-fetch)
                 state = STATE_ITEMS;
                 break;
             }
@@ -275,7 +311,7 @@ int main() {
                 ui.drawLoadingScreen(loadMsg);
                 break;
             case STATE_LIBRARIES:
-                ui.drawLibraryList(libraries, selLib, libOffset);
+                ui.drawLibraryGrid(libraries, libCovers, selLib, libOffset);
                 break;
             case STATE_ITEMS:
                 ui.drawItemList(items, selItem, itemOffset,
@@ -292,6 +328,7 @@ int main() {
         ui.endFrame();
     }
 
+    freeLibCovers();
     C2D_Fini();
     C3D_Fini();
     acExit();
