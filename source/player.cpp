@@ -1,4 +1,6 @@
 #include "player.h"
+#include "audio.h"
+#include "aacdec.h"
 #include <3ds.h>
 #include <cstring>
 #include <cstdio>
@@ -60,7 +62,10 @@ static int parsePAT(const u8* pl, int sz) {
 }
 
 // ─── PMT parser ───────────────────────────────────────────────────────────────
-static int parsePMT(const u8* pl, int sz) {
+// Returns the H.264 video PID (-1 if none). If audPid is non-null, also reports
+// the first AAC audio PID (0x0F = ADTS, 0x11 = LATM) via *audPid, or -1.
+static int parsePMT(const u8* pl, int sz, int* audPid = nullptr) {
+    if (audPid) *audPid = -1;
     if (sz < 13) return -1;
     int ptr = pl[0];
     const u8* t = pl + 1 + ptr;
@@ -71,14 +76,17 @@ static int parsePMT(const u8* pl, int sz) {
     int esBytes = secLen - 13 - piLen;
     const u8* es = t + 12 + piLen;
     int remEs    = rem - 12 - piLen;
+    int vid = -1;
     for (int o = 0; o+5 <= esBytes && o+5 <= remEs; ) {
         int type = es[o];
         int pid  = ((es[o+1]&0x1F)<<8)|es[o+2];
         int esil = ((es[o+3]&0x0F)<<8)|es[o+4];
-        if (type == 0x1B) return pid;
+        if (type == 0x1B && vid < 0) vid = pid;                       // H.264 video
+        else if ((type == 0x0F || type == 0x11) && audPid && *audPid < 0)
+            *audPid = pid;                                            // AAC audio
         o += 5 + esil;
     }
-    return -1;
+    return vid;
 }
 
 // ─── PES header skip ──────────────────────────────────────────────────────────
@@ -502,6 +510,46 @@ static void processH264(u8* pes, u32 pesLen,
     }
 }
 
+// ─── AAC audio decode (Helix) ─────────────────────────────────────────────────
+// The audio elementary stream is AAC-LC in ADTS framing (Jellyfin's AudioCodec=aac
+// inside an MPEG-TS). Each completed audio PES holds one or more ADTS frames; we
+// locate each syncword, decode it to interleaved PCM16 with Helix, and hand the
+// PCM to ndsp. The DSP then plays it asynchronously while the main thread paces
+// video — so audio runs free for now (tight A/V sync is a later refinement).
+static HAACDecoder g_aac = nullptr;
+// One ADTS frame decodes to at most 2048 samples/channel (1024 LC, doubled by SBR)
+// × 2 channels = 4096 interleaved shorts.
+static short       g_pcm[2048 * 2];
+
+static void processAAC(unsigned char* buf, int len, FILE* dbg) {
+    if (!g_aac || len <= 0) return;
+    static u32 frames = 0;
+    unsigned char* p = buf;
+    int bytesLeft = len;
+    while (bytesLeft > 0) {
+        int off = AACFindSyncWord(p, bytesLeft);
+        if (off < 0) break;                          // no (more) ADTS frames here
+        p += off; bytesLeft -= off;
+
+        int err = AACDecode(g_aac, &p, &bytesLeft, g_pcm);
+        if (err == ERR_AAC_INDATA_UNDERFLOW) break;  // frame split across PES → drop tail
+        if (err) {                                   // corrupt frame → skip a byte, resync
+            if (bytesLeft > 0) { p++; bytesLeft--; }
+            continue;
+        }
+
+        AACFrameInfo fi;
+        AACGetLastFrameInfo(g_aac, &fi);
+        if (fi.outputSamps <= 0 || fi.nChans <= 0) continue;
+        if (!audio::ready()) {
+            audio::configure(fi.sampRateOut, fi.nChans);
+            if (dbg) { fprintf(dbg, "AAC cfg: %d Hz x%d ch\n", fi.sampRateOut, fi.nChans); fflush(dbg); }
+        }
+        audio::push(g_pcm, fi.outputSamps / fi.nChans, fi.nChans);
+        if (++frames <= 3 && dbg) { fprintf(dbg, "AAC frame %u samps=%d\n", (unsigned)frames, fi.outputSamps); fflush(dbg); }
+    }
+}
+
 // ─── Player entry point ───────────────────────────────────────────────────────
 bool playerPlay(const std::string& url, long long runTimeTicks,
                 const std::string& series, const std::string& title, int year) {
@@ -545,12 +593,13 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     u8* pesBuf  = (u8*)linearAlloc(PES_SZ);
     u8* nalBuf  = (u8*)linearAlloc(NAL_SZ);
     u8* mvdOut  = (u8*)linearAlloc(VID_W * VID_H * 2);
+    u8* audBuf  = (u8*)linearAlloc(PES_SZ);   // audio PES accumulator (ADTS frames)
 
-    if (!g_ring.data || !pesBuf || !nalBuf || !mvdOut) {
+    if (!g_ring.data || !pesBuf || !nalBuf || !mvdOut || !audBuf) {
         printf("alloc failed\n");
         if (dbg) { fprintf(dbg, "alloc failed\n"); fclose(dbg); }
         linearFree(g_ring.data); linearFree(pesBuf);
-        linearFree(nalBuf); linearFree(mvdOut);
+        linearFree(nalBuf); linearFree(mvdOut); linearFree(audBuf);
         svcSleepThread(3000000000LL);
         return false;
     }
@@ -593,6 +642,14 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     DLOG(dbg, "NULLrender probe=%08lX (FFFFFFFF=stock libctru, else=patched mvd.c)\n",
          (unsigned long)nullProbe);
 
+    // ─── Audio: ndsp output + Helix AAC decoder ───────────────────────────────
+    // ndsp init fails (and audio stays silent) if dsp_firm wasn't dumped to the
+    // SD card; that's non-fatal — video still plays. The decoder is configured
+    // lazily from the first decoded frame's real sample rate / channel count.
+    bool audioOn = audio::init();
+    g_aac = AACInitDecoder();
+    DLOG(dbg, "audio: ndsp=%d aacDec=%p\n", (int)audioOn, (void*)g_aac);
+
     // Open HTTP stream
     httpcContext ctx;
     bool    ok         = false;
@@ -612,9 +669,11 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     if (!ok) {
         printf("HTTP fail, B to exit\n");
         if (dbg) fclose(dbg);
+        AACFreeDecoder(g_aac); g_aac = nullptr;
+        audio::exit();
         mvdstdExit();
         linearFree(g_ring.data); linearFree(pesBuf);
-        linearFree(nalBuf); linearFree(mvdOut);
+        linearFree(nalBuf); linearFree(mvdOut); linearFree(audBuf);
         // Wait for B so user can read the error
         while (aptMainLoop()) {
             hidScanInput();
@@ -628,8 +687,11 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     // ─── Decode loop ─────────────────────────────────────────────────────────
     int  pmtPid    = -1;
     int  vidPid    = -1;
+    int  audPid    = -1;
     u32  pesLen    = 0;
     bool pesActive = false;
+    u32  audLen    = 0;
+    bool audActive = false;
     bool stop       = false;
     bool mvdFirst   = true;   // first access unit is fed twice (params, then decode)
     u32  frameCount = 0;
@@ -727,10 +789,23 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                     if (dbg) { fprintf(dbg,"PAT pmtPid=%d\n",pmtPid); fflush(dbg); }
                 }
             } else if (pmtPid!=-1 && pid==pmtPid && pay && vidPid==-1) {
-                vidPid = parsePMT(pay, psz);
+                vidPid = parsePMT(pay, psz, &audPid);
                 if (vidPid!=-1) {
-                    DBG("PMT->vidPid=%d\n", vidPid);
-                    if (dbg) { fprintf(dbg,"PMT vidPid=%d\n",vidPid); fflush(dbg); }
+                    DBG("PMT->vidPid=%d audPid=%d\n", vidPid, audPid);
+                    if (dbg) { fprintf(dbg,"PMT vidPid=%d audPid=%d\n",vidPid,audPid); fflush(dbg); }
+                }
+            } else if (audPid!=-1 && pid==audPid && pay) {
+                // Audio elementary stream: accumulate a PES, then decode its ADTS
+                // frames when the next PES starts (PUSI).
+                if (pusi) {
+                    if (audActive && audLen > 0)
+                        processAAC(audBuf, (int)audLen, dbg);
+                    int skip = pesHeaderLen(pay, psz);
+                    audLen = 0; audActive = true;
+                    int cp = psz - skip;
+                    if (cp > 0 && (u32)cp <= PES_SZ) { memcpy(audBuf, pay+skip, cp); audLen = cp; }
+                } else if (audActive && audLen+psz <= PES_SZ) {
+                    memcpy(audBuf+audLen, pay, psz); audLen += psz;
                 }
             } else if (vidPid!=-1 && pid==vidPid && pay) {
                 if (pusi) {
@@ -793,8 +868,10 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     threadFree(dlThr);
 
     httpcCloseContext(&ctx);
+    AACFreeDecoder(g_aac); g_aac = nullptr;
+    audio::exit();
     mvdstdExit();
     linearFree(g_ring.data); linearFree(pesBuf);
-    linearFree(nalBuf); linearFree(mvdOut);
+    linearFree(nalBuf); linearFree(mvdOut); linearFree(audBuf);
     return true;
 }

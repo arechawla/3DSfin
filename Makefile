@@ -9,9 +9,9 @@ include $(DEVKITARM)/3ds_rules
 
 TARGET      := 3dsfin
 BUILD       := build
-SOURCES     := source
+SOURCES     := source source/aac
 DATA        := data
-INCLUDES    := source
+INCLUDES    := source source/aac
 
 APP_TITLE       := 3DSFin
 APP_DESCRIPTION := Jellyfin client for 3DS
