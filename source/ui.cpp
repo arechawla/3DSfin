@@ -185,6 +185,40 @@ static u32 placeholderColor(const std::string& type) {
     return C2D_Color32(0x3a, 0x3a, 0x52, 0xFF);                         // neutral
 }
 
+// Draw an image so it fills the whole x/y/w/h box without distortion ("cover"):
+// scale uniformly to cover the box, then center-crop the overflow by trimming the
+// subtexture's UV rect to the box's aspect ratio. (C2D_DrawImageAt with separate
+// sx/sy would instead *stretch* the art, smearing portrait covers into the card.)
+static void drawImageCover(const C2D_Image& im, float x, float y, float w, float h) {
+    const float iw = (float)im.subtex->width;
+    const float ih = (float)im.subtex->height;
+    if (iw <= 0 || ih <= 0) return;
+
+    // Work on a copy of the subtexture so we can shrink its UV window.
+    Tex3DS_SubTexture st = *im.subtex;
+    const float imgA  = iw / ih;
+    const float boxA  = w / h;
+
+    if (imgA > boxA) {
+        // Source is wider than the box → keep full height, crop left/right.
+        const float keep = boxA / imgA;                  // fraction of width shown
+        const float trim = (st.right - st.left) * (1.0f - keep) * 0.5f;
+        st.left  += trim;
+        st.right -= trim;
+        st.width  = (u16)(iw * keep);
+    } else {
+        // Source is taller than the box → keep full width, crop top/bottom.
+        const float keep = imgA / boxA;                  // fraction of height shown
+        const float trim = (st.top - st.bottom) * (1.0f - keep) * 0.5f;  // top > bottom
+        st.top    -= trim;
+        st.bottom += trim;
+        st.height  = (u16)(ih * keep);
+    }
+
+    C2D_Image cropped = { im.tex, &st };
+    C2D_DrawImageAt(cropped, x, y, 0.0f, nullptr, w / (float)st.width, h / (float)st.height);
+}
+
 void UI::drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
                          const std::vector<C2D_Image>& covers,
                          int selected, int offset) {
@@ -217,10 +251,7 @@ void UI::drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
 
         bool hasImg = (idx < (int)covers.size() && covers[idx].tex != nullptr);
         if (hasImg) {
-            const C2D_Image& im = covers[idx];
-            float sx = cardW / (float)im.subtex->width;
-            float sy = cardH / (float)im.subtex->height;
-            C2D_DrawImageAt(im, x, y, 0.0f, nullptr, sx, sy);
+            drawImageCover(covers[idx], x, y, cardW, cardH);
         } else {
             drawRect(x, y, cardW, cardH, placeholderColor(libs[idx].collectionType));
         }

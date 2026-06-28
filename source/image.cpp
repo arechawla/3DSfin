@@ -49,9 +49,15 @@ bool Image_loadFromMemory(const unsigned char* data, size_t len, C2D_Image* out)
     // transfer tiles it into the texture in GPU_RGBA8 order. stb writes bytes
     // R,G,B,A (u32 = 0xAABBGGRR); bswap -> bytes A,B,G,R as the transfer wants.
     //
+    // Image data is staged into the TOP-LEFT of the POT texture (rows 0..h-1),
+    // which is exactly what the subtexture UVs above sample (top=1.0 down to
+    // 1-h/ph). The display transfer must therefore NOT flip vertically — a flip
+    // would move the pixels into the bottom rows, leaving the sampled region as
+    // transparent padding and the art only partly visible.
+    //
     // *** ON-DEVICE TUNABLES (if the art looks wrong): ***
     //   - colors with R/B swapped  -> remove the __builtin_bswap32 below
-    //   - image upside-down        -> flip GX_TRANSFER_FLIP_VERT(1) to (0)
+    //   - image upside-down        -> flip GX_TRANSFER_FLIP_VERT(0) to (1)
     u32* stage = (u32*)linearAlloc(pw * ph * 4);
     if (!stage) { C3D_TexDelete(tex); free(tex); free(sub); stbi_image_free(rgba); return false; }
     memset(stage, 0, pw * ph * 4);
@@ -64,7 +70,7 @@ bool Image_loadFromMemory(const unsigned char* data, size_t len, C2D_Image* out)
     C3D_SyncDisplayTransfer(
         stage,           GX_BUFFER_DIM(pw, ph),
         (u32*)tex->data, GX_BUFFER_DIM(pw, ph),
-        GX_TRANSFER_FLIP_VERT(1)  | GX_TRANSFER_OUT_TILED(1) | GX_TRANSFER_RAW_COPY(0) |
+        GX_TRANSFER_FLIP_VERT(0)  | GX_TRANSFER_OUT_TILED(1) | GX_TRANSFER_RAW_COPY(0) |
         GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8)  |
         GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGBA8) |
         GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
