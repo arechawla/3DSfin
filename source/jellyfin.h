@@ -16,6 +16,7 @@ struct JellyfinItem {
     std::string seriesName;     // parent series (episodes only)
     long long   runTimeTicks;   // 10,000,000 ticks per second
     int         productionYear;
+    long long   resumeTicks;    // saved playback position (0 = start), from UserData
 };
 
 class JellyfinClient {
@@ -35,8 +36,14 @@ public:
                                        int startIndex = 0,
                                        int limit      = 50);
 
-    // Returns a direct-stream URL pre-configured for 3DS capabilities
-    std::string getStreamUrl(const std::string& itemId) const;
+    // In-progress items across all libraries ("Continue Watching"), newest first.
+    // Each item's resumeTicks holds the saved playback position.
+    std::vector<JellyfinItem> getResumeItems(int limit = 12);
+
+    // Returns a direct-stream URL pre-configured for 3DS capabilities.
+    // startTicks seeks the transcode to a resume position (0 = from the start).
+    std::string getStreamUrl(const std::string& itemId,
+                             long long startTicks = 0) const;
 
     // Fetches the raw Primary-image bytes (JPEG) for an item/library, scaled to
     // fillWidth px. Returns an empty string if the item has no image or on error.

@@ -17,6 +17,9 @@ public:
     static constexpr int GRID_COLS         = 2;
     static constexpr int GRID_ROWS_VISIBLE = 2;
 
+    // "Continue Watching" poster strip on the bottom screen of the grid view.
+    static constexpr int RESUME_VISIBLE    = 4;   // poster cards shown at once
+
     UI(C3D_RenderTarget* top, C3D_RenderTarget* bot);
     ~UI();
 
@@ -29,10 +32,15 @@ public:
     void drawErrorScreen(const std::string& msg);
 
     // Grid of library cover-art cards. covers is parallel to libs; a card whose
-    // covers[i].tex is null falls back to a colored placeholder.
+    // covers[i].tex is null falls back to a colored placeholder. The bottom screen
+    // shows a "Continue Watching" poster strip built from resume/resumeCovers;
+    // resumeFocus selects whether the d-pad is currently driving the grid or strip.
     void drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
                          const std::vector<C2D_Image>& covers,
-                         int selected, int offset);
+                         int selected, int offset,
+                         const std::vector<JellyfinItem>& resume,
+                         const std::vector<C2D_Image>& resumeCovers,
+                         int resumeSel, int resumeOffset, bool resumeFocus);
 
     void drawItemList(const std::vector<JellyfinItem>& items,
                       int selected, int offset,
@@ -54,6 +62,9 @@ private:
     void drawBottomHints(const std::string& hints);
     void drawScrollList(const std::vector<std::string>& rows,
                         int selected, int offset);
+    void drawResumeStrip(const std::vector<JellyfinItem>& resume,
+                         const std::vector<C2D_Image>& covers,
+                         int sel, int offset, bool focus);
 
     static std::string formatDuration(long long ticks);
     static std::string truncate(const std::string& s, size_t maxLen);

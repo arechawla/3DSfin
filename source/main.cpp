@@ -41,9 +41,22 @@ static std::vector<std::string>     libCoverData;  // raw JPEG bytes cache (surv
 static std::vector<JellyfinItem>    items;
 static int selLib  = 0, libOffset  = 0;
 
+// "Continue Watching" strip (bottom screen of the grid view). resumeFocus flips
+// the d-pad between the top-screen grid and this strip.
+static std::vector<JellyfinItem> resumeItems;
+static std::vector<C2D_Image>    resumeCovers;
+static std::vector<std::string>  resumeCoverData;
+static int  selResume = 0, resumeOffset = 0;
+static bool resumeFocus = false;
+
 static void freeLibCovers() {
     for (auto& im : libCovers) Image_free(&im);
     libCovers.clear();
+}
+
+static void freeResumeCovers() {
+    for (auto& im : resumeCovers) Image_free(&im);
+    resumeCovers.clear();
 }
 
 // (Re)build cover textures from the cached JPEG bytes — no network. Called after
@@ -65,8 +78,36 @@ static void fetchLibCovers() {
         libCoverData[i] = client.getPrimaryImage(libraries[i].id, 256);
     buildCoverTextures();
 }
+
+// (Re)build resume poster textures from cached JPEG bytes — no network.
+static void buildResumeTextures() {
+    freeResumeCovers();
+    resumeCovers.assign(resumeItems.size(), C2D_Image{});
+    for (size_t i = 0; i < resumeCoverData.size() && i < resumeCovers.size(); i++)
+        if (!resumeCoverData[i].empty())
+            Image_loadFromMemory(
+                reinterpret_cast<const unsigned char*>(resumeCoverData[i].data()),
+                resumeCoverData[i].size(), &resumeCovers[i]);
+}
+
+// Fetch the "Continue Watching" list and its poster art, then build textures.
+static void fetchResume() {
+    resumeItems  = client.getResumeItems();
+    selResume    = 0;
+    resumeOffset = 0;
+    resumeFocus  = false;
+    resumeCoverData.assign(resumeItems.size(), std::string());
+    for (size_t i = 0; i < resumeItems.size(); i++)
+        resumeCoverData[i] = client.getPrimaryImage(resumeItems[i].id, 200);
+    buildResumeTextures();
+}
 static int selItem = 0, itemOffset = 0;
 static std::string playerUrl;
+// Set just before entering STATE_PLAYER. playItem can come from either the item
+// list or the Continue Watching strip, so the player path is source-agnostic.
+static JellyfinItem playItem;
+static double       playStartSec = 0.0;
+static AppState     playReturn   = STATE_ITEMS;
 static std::string pendingUsername;
 static std::string pendingPassword;
 
@@ -189,6 +230,7 @@ int main() {
                     selLib     = 0;
                     libOffset  = 0;
                     fetchLibCovers();   // network: cache JPEGs + build textures
+                    fetchResume();      // Continue Watching list + poster art
                     state      = STATE_LIBRARIES;
                     break;
 
@@ -237,10 +279,34 @@ int main() {
             case STATE_LIBRARIES: {
                 int n    = (int)libraries.size();
                 int cols = UI::GRID_COLS;
+
+                // Focus lives in the Continue Watching strip on the bottom screen.
+                if (resumeFocus) {
+                    int rn = (int)resumeItems.size();
+                    if (kDown & KEY_UP) { resumeFocus = false; break; }
+                    if (kDown & KEY_RIGHT && selResume < rn - 1) selResume++;
+                    if (kDown & KEY_LEFT  && selResume > 0)      selResume--;
+                    // Keep the selected poster within the visible window.
+                    if (selResume < resumeOffset) resumeOffset = selResume;
+                    if (selResume >= resumeOffset + UI::RESUME_VISIBLE)
+                        resumeOffset = selResume - UI::RESUME_VISIBLE + 1;
+                    if (kDown & KEY_A && rn > 0) {
+                        playItem     = resumeItems[selResume];
+                        playStartSec = playItem.resumeTicks / 10000000.0;
+                        playerUrl    = client.getStreamUrl(playItem.id, playItem.resumeTicks);
+                        playReturn   = STATE_LIBRARIES;
+                        state        = STATE_PLAYER;
+                    }
+                    break;
+                }
+
                 if (kDown & KEY_RIGHT && selLib < n - 1 && (selLib % cols) != cols - 1) selLib++;
                 if (kDown & KEY_LEFT  && (selLib % cols) != 0)                          selLib--;
                 if (kDown & KEY_DOWN  && selLib + cols < n)                             selLib += cols;
                 if (kDown & KEY_UP    && selLib - cols >= 0)                            selLib -= cols;
+                // DOWN with no grid row below drops focus into the Continue Watching strip.
+                if (kDown & KEY_DOWN && selLib + cols >= n && !resumeItems.empty())
+                    resumeFocus = true;
                 // Scroll so the selected row stays visible (libOffset is in rows).
                 int selRow = selLib / cols;
                 if (selRow < libOffset) libOffset = selRow;
@@ -266,20 +332,25 @@ int main() {
                     if (selItem < itemOffset) itemOffset--;
                 }
                 if (kDown & KEY_A && !items.empty()) {
-                    playerUrl = client.getStreamUrl(items[selItem].id);
-                    state     = STATE_PLAYER;
+                    playItem     = items[selItem];
+                    playStartSec = 0.0;
+                    playerUrl    = client.getStreamUrl(playItem.id);
+                    playReturn   = STATE_ITEMS;
+                    state        = STATE_PLAYER;
                 }
                 break;
 
             case STATE_PLAYER: {
-                freeLibCovers();   // textures live in VRAM that playback tears down
+                freeLibCovers();      // textures live in VRAM that playback tears down
+                freeResumeCovers();
                 C2D_Fini();
                 C3D_Fini();
 
-                playerPlay(playerUrl, items[selItem].runTimeTicks,
-                           items[selItem].seriesName,
-                           items[selItem].name,
-                           items[selItem].productionYear);
+                playerPlay(playerUrl, playItem.runTimeTicks,
+                           playItem.seriesName,
+                           playItem.name,
+                           playItem.productionYear,
+                           playStartSec);
 
                 C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
                 C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
@@ -288,8 +359,9 @@ int main() {
                 botScreen = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
                 ui.~UI();
                 new (&ui) UI(topScreen, botScreen);
-                buildCoverTextures();   // rebuild from cached JPEG bytes (no re-fetch)
-                state = STATE_ITEMS;
+                buildCoverTextures();    // rebuild from cached JPEG bytes (no re-fetch)
+                buildResumeTextures();
+                state = playReturn;
                 break;
             }
 
@@ -320,14 +392,16 @@ int main() {
                 ui.drawLoadingScreen(loadMsg);
                 break;
             case STATE_LIBRARIES:
-                ui.drawLibraryGrid(libraries, libCovers, selLib, libOffset);
+                ui.drawLibraryGrid(libraries, libCovers, selLib, libOffset,
+                                   resumeItems, resumeCovers,
+                                   selResume, resumeOffset, resumeFocus);
                 break;
             case STATE_ITEMS:
                 ui.drawItemList(items, selItem, itemOffset,
                                 libraries[selLib].name);
                 break;
             case STATE_PLAYER:
-                ui.drawPlayerScreen(items[selItem], playerUrl);
+                ui.drawPlayerScreen(playItem, playerUrl);
                 break;
             case STATE_ERROR:
                 ui.drawErrorScreen(errorMsg);
@@ -338,6 +412,7 @@ int main() {
     }
 
     freeLibCovers();
+    freeResumeCovers();
     C2D_Fini();
     C3D_Fini();
     acExit();

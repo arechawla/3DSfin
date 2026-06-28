@@ -229,12 +229,55 @@ std::vector<JellyfinItem> JellyfinClient::getItems(const std::string& parentId,
         item.seriesName     = jStr(obj, "SeriesName");   // present for episodes
         item.productionYear = 0;
         item.runTimeTicks   = 0;
+        item.resumeTicks    = 0;
 
         std::string ticks = jStr(obj, "RunTimeTicks");
         if (!ticks.empty()) item.runTimeTicks = std::stoll(ticks);
 
         std::string year = jStr(obj, "ProductionYear");
         if (!year.empty()) item.productionYear = std::stoi(year);
+
+        if (!item.id.empty()) result.push_back(item);
+    });
+    return result;
+}
+
+std::vector<JellyfinItem> JellyfinClient::getResumeItems(int limit) {
+    std::vector<JellyfinItem> result;
+
+    char path[512];
+    snprintf(path, sizeof(path),
+             "/Users/%s/Items/Resume"
+             "?MediaTypes=Video"
+             "&Recursive=true"
+             "&Fields=RunTimeTicks,ProductionYear"
+             "&Limit=%d",
+             userId_.c_str(), limit);
+
+    auto resp = http_.get(path);
+    if (!resp.ok()) return result;
+
+    std::string arr = jArr(resp.body, "Items");
+    jForEach(arr, [&](const std::string& obj) {
+        JellyfinItem item;
+        item.id             = jStr(obj, "Id");
+        item.name           = jStr(obj, "Name");
+        item.type           = jStr(obj, "Type");
+        item.seriesName     = jStr(obj, "SeriesName");   // present for episodes
+        item.productionYear = 0;
+        item.runTimeTicks   = 0;
+        item.resumeTicks    = 0;
+
+        std::string ticks = jStr(obj, "RunTimeTicks");
+        if (!ticks.empty()) item.runTimeTicks = std::stoll(ticks);
+
+        std::string year = jStr(obj, "ProductionYear");
+        if (!year.empty()) item.productionYear = std::stoi(year);
+
+        // PlaybackPositionTicks lives inside the nested "UserData" object; jStr's
+        // first-occurrence search finds it without isolating the sub-object.
+        std::string pos = jStr(obj, "PlaybackPositionTicks");
+        if (!pos.empty()) item.resumeTicks = std::stoll(pos);
 
         if (!item.id.empty()) result.push_back(item);
     });
@@ -251,7 +294,8 @@ std::string JellyfinClient::getPrimaryImage(const std::string& itemId, int fillW
     return resp.body;            // raw JPEG bytes (binary-safe)
 }
 
-std::string JellyfinClient::getStreamUrl(const std::string& itemId) const {
+std::string JellyfinClient::getStreamUrl(const std::string& itemId,
+                                         long long startTicks) const {
     // Ask Jellyfin to transcode to H.264/AAC at 3DS-friendly resolution.
     // Phase 2: feed this URL to the MVD hardware decoder.
     char url[1024];
@@ -284,8 +328,9 @@ std::string JellyfinClient::getStreamUrl(const std::string& itemId) const {
              "&MaxHeight=240"
              "&SubtitleMethod=None"
              "&IsPlayback=true"
-             "&StartTimeTicks=0",
+             // Seek the transcode to the resume position (0 = from the start).
+             "&StartTimeTicks=%lld",
              serverUrl_.c_str(), itemId.c_str(),
-             accessToken_.c_str(), deviceId_.c_str());
+             accessToken_.c_str(), deviceId_.c_str(), startTicks);
     return std::string(url);
 }

@@ -552,7 +552,8 @@ static void processAAC(unsigned char* buf, int len, FILE* dbg) {
 
 // ─── Player entry point ───────────────────────────────────────────────────────
 bool playerPlay(const std::string& url, long long runTimeTicks,
-                const std::string& series, const std::string& title, int year) {
+                const std::string& series, const std::string& title, int year,
+                double startSec) {
     // C2D_CreateScreenTarget replaced gfx's framebuffer pointers with its own VRAM
     // allocation. After C3D_Fini that VRAM is freed but the pointers stay stale.
     // gfxSetScreenFormat is a no-op when the format hasn't changed, so it doesn't
@@ -701,7 +702,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
 
     // Seek-bar state: position from PES PTS, total from the Jellyfin item.
     double    durSec      = runTimeTicks > 0 ? runTimeTicks / 10000000.0 : 0.0;
-    double    posSec      = 0.0;
+    double    posSec      = startSec;      // resume offset; PTS delta is added below
     long long firstPts    = -1;          // PTS of the first frame (position origin)
     long long curPesPts   = -1;          // PTS of the access unit now being accumulated
     int       lastShownSec = -1;         // throttle: redraw bar only when seconds change
@@ -814,7 +815,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                         if (firstPts < 0) firstPts = pts;
                         long long d = pts - firstPts;
                         if (d < 0) d += (1LL << 33);   // 33-bit PTS wraparound
-                        posSec = d / 90000.0;
+                        posSec = startSec + d / 90000.0;
                     }
                     if (pesActive && pesLen > 0)
                         processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg,curPesPts);

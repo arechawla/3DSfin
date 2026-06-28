@@ -219,9 +219,70 @@ static void drawImageCover(const C2D_Image& im, float x, float y, float w, float
     C2D_DrawImageAt(cropped, x, y, 0.0f, nullptr, w / (float)st.width, h / (float)st.height);
 }
 
+// Bottom-screen "Continue Watching" poster strip for the library grid view.
+void UI::drawResumeStrip(const std::vector<JellyfinItem>& resume,
+                         const std::vector<C2D_Image>& covers,
+                         int sel, int offset, bool focus) {
+    drawText("Continue Watching", 8, 6, 0.50f, focus ? COL_WHITE : COL_GREY);
+
+    if (resume.empty()) {
+        drawText("Nothing in progress", 8, 100, 0.46f, COL_GREY);
+        return;
+    }
+
+    const int   vis    = RESUME_VISIBLE;
+    const float mx     = 8.0f;
+    const float gap    = 8.0f;
+    const float cardW  = (BOT_W - 2 * mx - (vis - 1) * gap) / vis;  // ~70
+    const float postH  = 104.0f;
+    const float top    = 28.0f;
+
+    for (int i = 0; i < vis; i++) {
+        int idx = offset + i;
+        if (idx >= (int)resume.size()) break;
+
+        float x   = mx + i * (cardW + gap);
+        bool  hl  = focus && idx == sel;
+
+        if (hl) drawRect(x - 3, top - 3, cardW + 6, postH + 6, COL_SEL);
+
+        bool hasImg = (idx < (int)covers.size() && covers[idx].tex != nullptr);
+        if (hasImg) drawImageCover(covers[idx], x, top, cardW, postH);
+        else        drawRect(x, top, cardW, postH, COL_ROW_ALT);
+
+        // Progress bar pinned to the bottom of the poster.
+        float frac = 0.0f;
+        if (resume[idx].runTimeTicks > 0)
+            frac = (float)resume[idx].resumeTicks / (float)resume[idx].runTimeTicks;
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+        drawRect(x, top + postH - 5, cardW,        5, C2D_Color32(0, 0, 0, 0xC0));
+        drawRect(x, top + postH - 5, cardW * frac, 5, COL_YELLOW);
+
+        // Episodes read better as series name; movies use their own title.
+        const std::string& label = !resume[idx].seriesName.empty()
+                                  ? resume[idx].seriesName : resume[idx].name;
+        drawTextBuf(label, x, top + postH + 4, 0.40f,
+                    hl ? COL_WHITE : COL_GREY, cardW);
+    }
+
+    // Horizontal scroll indicator when more items exist than fit.
+    if ((int)resume.size() > vis) {
+        float barW   = BOT_W - 16;
+        float thumbW = barW * vis / resume.size();
+        float thumbX = 8 + barW * offset / resume.size();
+        float y      = top + postH + 22;
+        drawRect(8,      y, barW,   3, COL_ROW_ALT);
+        drawRect(thumbX, y, thumbW, 3, COL_GREY);
+    }
+}
+
 void UI::drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
                          const std::vector<C2D_Image>& covers,
-                         int selected, int offset) {
+                         int selected, int offset,
+                         const std::vector<JellyfinItem>& resume,
+                         const std::vector<C2D_Image>& resumeCovers,
+                         int resumeSel, int resumeOffset, bool resumeFocus) {
     C2D_SceneBegin(top_);
     drawTopBar("Libraries");
 
@@ -273,12 +334,14 @@ void UI::drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
 
     C2D_SceneBegin(bot_);
     drawRect(0, 0, BOT_W, BOT_H, COL_BG_BOT);
-    if (selected >= 0 && selected < (int)libs.size()) {
-        drawText(truncate(libs[selected].name, 28), 8, 30, 0.58f, COL_WHITE);
-        if (!libs[selected].collectionType.empty())
-            drawText(libs[selected].collectionType, 8, 60, 0.46f, COL_GREY);
-    }
-    drawBottomHints("A: Open   D-Pad: Move   START: Quit");
+    drawResumeStrip(resume, resumeCovers, resumeSel, resumeOffset, resumeFocus);
+
+    if (resumeFocus)
+        drawBottomHints("A: Resume   LEFT/RIGHT: Select   UP: Libraries");
+    else if (!resume.empty())
+        drawBottomHints("A: Open   D-Pad: Move   DOWN: Continue Watching");
+    else
+        drawBottomHints("A: Open   D-Pad: Move   START: Quit");
 }
 
 void UI::drawItemList(const std::vector<JellyfinItem>& items,
