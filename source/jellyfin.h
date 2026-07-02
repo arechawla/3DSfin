@@ -11,12 +11,20 @@ struct JellyfinLibrary {
 
 struct JellyfinItem {
     std::string id;
-    std::string name;           // movie title / episode name
-    std::string type;           // "Movie", "Episode", "Series"
+    std::string name;           // movie title / episode name / season name
+    std::string type;           // "Movie", "Episode", "Series", "Season"
     std::string seriesName;     // parent series (episodes only)
     long long   runTimeTicks;   // 10,000,000 ticks per second
     int         productionYear;
     long long   resumeTicks;    // saved playback position (0 = start), from UserData
+};
+
+// Which children to enumerate beneath a parent when browsing.
+enum class ChildKind {
+    Direct,             // a library's direct children: Movies or Series, by name
+    Seasons,            // a series' seasons, ordered by season number
+    Episodes,           // a season's episodes, ordered by episode number
+    EpisodesRecursive,  // every episode beneath a series, flattened (seasonless fallback)
 };
 
 class JellyfinClient {
@@ -31,10 +39,12 @@ public:
 
     std::vector<JellyfinLibrary> getLibraries();
 
-    // parentId = library Id; limit = items per page
-    std::vector<JellyfinItem> getItems(const std::string& parentId,
-                                       int startIndex = 0,
-                                       int limit      = 50);
+    // Lists a parent's children according to kind: a library's movies/series,
+    // a series' seasons, a season's episodes, or (fallback) every episode beneath
+    // a series flattened in season/episode order. limit caps the page size.
+    std::vector<JellyfinItem> getChildren(const std::string& parentId,
+                                          ChildKind kind  = ChildKind::Direct,
+                                          int       limit = 200);
 
     // In-progress items across all libraries ("Continue Watching"), newest first.
     // Each item's resumeTicks holds the saved playback position.

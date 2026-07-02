@@ -201,21 +201,65 @@ std::vector<JellyfinLibrary> JellyfinClient::getLibraries() {
     return result;
 }
 
-std::vector<JellyfinItem> JellyfinClient::getItems(const std::string& parentId,
-                                                    int startIndex,
-                                                    int limit) {
+std::vector<JellyfinItem> JellyfinClient::getChildren(const std::string& parentId,
+                                                      ChildKind kind,
+                                                      int       limit) {
     std::vector<JellyfinItem> result;
 
     char path[512];
-    snprintf(path, sizeof(path),
-             "/Users/%s/Items"
-             "?ParentId=%s"
-             "&IncludeItemTypes=Movie,Episode,Series"
-             "&Recursive=true"
-             "&Fields=RunTimeTicks,ProductionYear"
-             "&SortBy=SortName&SortOrder=Ascending"
-             "&StartIndex=%d&Limit=%d",
-             userId_.c_str(), parentId.c_str(), startIndex, limit);
+    switch (kind) {
+    case ChildKind::Seasons:
+        // A series' seasons, ordered by season number. No Recursive so episodes
+        // stay one level down.
+        snprintf(path, sizeof(path),
+                 "/Users/%s/Items"
+                 "?ParentId=%s"
+                 "&IncludeItemTypes=Season"
+                 "&Fields=RunTimeTicks,ProductionYear"
+                 "&SortBy=IndexNumber,SortName&SortOrder=Ascending"
+                 "&Limit=%d",
+                 userId_.c_str(), parentId.c_str(), limit);
+        break;
+
+    case ChildKind::Episodes:
+        // A single season's episodes, ordered by episode number.
+        snprintf(path, sizeof(path),
+                 "/Users/%s/Items"
+                 "?ParentId=%s"
+                 "&IncludeItemTypes=Episode"
+                 "&Fields=RunTimeTicks,ProductionYear"
+                 "&SortBy=ParentIndexNumber,IndexNumber&SortOrder=Ascending"
+                 "&Limit=%d",
+                 userId_.c_str(), parentId.c_str(), limit);
+        break;
+
+    case ChildKind::EpisodesRecursive:
+        // Every episode beneath a series, flattened across seasons and ordered
+        // by season (ParentIndexNumber) then episode (IndexNumber).
+        snprintf(path, sizeof(path),
+                 "/Users/%s/Items"
+                 "?ParentId=%s"
+                 "&IncludeItemTypes=Episode"
+                 "&Recursive=true"
+                 "&Fields=RunTimeTicks,ProductionYear"
+                 "&SortBy=ParentIndexNumber,IndexNumber&SortOrder=Ascending"
+                 "&Limit=%d",
+                 userId_.c_str(), parentId.c_str(), limit);
+        break;
+
+    case ChildKind::Direct:
+    default:
+        // Direct children only: a Movies library yields Movies, a Shows library
+        // yields Series. No Recursive so episodes don't bubble up to this level.
+        snprintf(path, sizeof(path),
+                 "/Users/%s/Items"
+                 "?ParentId=%s"
+                 "&Fields=RunTimeTicks,ProductionYear"
+                 "&SortBy=SortName&SortOrder=Ascending"
+                 "&Limit=%d",
+                 userId_.c_str(), parentId.c_str(), limit);
+        break;
+    }
 
     auto resp = http_.get(path);
     if (!resp.ok()) return result;
@@ -236,6 +280,10 @@ std::vector<JellyfinItem> JellyfinClient::getItems(const std::string& parentId,
 
         std::string year = jStr(obj, "ProductionYear");
         if (!year.empty()) item.productionYear = std::stoi(year);
+
+        // Resume a partially-watched item when launched straight from the grid.
+        std::string pos = jStr(obj, "PlaybackPositionTicks");
+        if (!pos.empty()) item.resumeTicks = std::stoll(pos);
 
         if (!item.id.empty()) result.push_back(item);
     });

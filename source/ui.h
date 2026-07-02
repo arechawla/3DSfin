@@ -20,6 +20,10 @@ public:
     // "Continue Watching" poster strip on the bottom screen of the grid view.
     static constexpr int RESUME_VISIBLE    = 4;   // poster cards shown at once
 
+    // Item cover grid (movies / series / episodes inside a library)
+    static constexpr int ITEM_GRID_COLS         = 4;
+    static constexpr int ITEM_GRID_ROWS_VISIBLE = 2;
+
     UI(C3D_RenderTarget* top, C3D_RenderTarget* bot);
     ~UI();
 
@@ -42,9 +46,13 @@ public:
                          const std::vector<C2D_Image>& resumeCovers,
                          int resumeSel, int resumeOffset, bool resumeFocus);
 
-    void drawItemList(const std::vector<JellyfinItem>& items,
+    // Cover grid of the items inside a library level (movies, series, or
+    // episodes). covers is parallel to items; a null tex falls back to a colored
+    // placeholder. title is shown in the top bar (library or series name).
+    void drawItemGrid(const std::vector<JellyfinItem>& items,
+                      const std::vector<C2D_Image>& covers,
                       int selected, int offset,
-                      const std::string& libraryName);
+                      const std::string& title);
 
     void drawPlayerScreen(const JellyfinItem& item, const std::string& streamUrl);
 

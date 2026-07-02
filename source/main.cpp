@@ -24,7 +24,8 @@ enum PendingLoad {
     LOAD_NONE,
     LOAD_CONNECT_AND_AUTH,
     LOAD_LIBRARIES,
-    LOAD_ITEMS,
+    LOAD_ITEMS,   // open a library: list its movies/series
+    LOAD_DRILL,   // open a series/season: list its seasons/episodes (see drillKind)
 };
 
 // ---- Globals ---------------------------------------------------------------
@@ -38,8 +39,21 @@ static std::string errorMsg;
 static std::vector<JellyfinLibrary> libraries;
 static std::vector<C2D_Image>       libCovers;     // GPU textures, parallel to libraries
 static std::vector<std::string>     libCoverData;  // raw JPEG bytes cache (survives C3D_Fini)
-static std::vector<JellyfinItem>    items;
 static int selLib  = 0, libOffset  = 0;
+
+// One level of the library → series → episodes browse hierarchy. coverData (raw
+// JPEG bytes) is cached so textures can be rebuilt after playback frees VRAM and
+// when popping back to a level; only the top level keeps live GPU textures.
+struct BrowseLevel {
+    std::string              parentId;
+    std::string              title;        // top-bar label (library/series/season name)
+    ChildKind                kind;         // what this level's items are
+    std::vector<JellyfinItem> items;
+    std::vector<std::string>  coverData;
+    std::vector<C2D_Image>    covers;
+    int sel = 0, offset = 0;
+};
+static std::vector<BrowseLevel> browseStack;
 
 // "Continue Watching" strip (bottom screen of the grid view). resumeFocus flips
 // the d-pad between the top-screen grid and this strip.
@@ -101,13 +115,70 @@ static void fetchResume() {
         resumeCoverData[i] = client.getPrimaryImage(resumeItems[i].id, 200);
     buildResumeTextures();
 }
-static int selItem = 0, itemOffset = 0;
+
+// ---- Browse stack helpers --------------------------------------------------
+// Invariant: only the top level (browseStack.back()) holds live GPU textures.
+
+static void freeLevelCovers(BrowseLevel& lv) {
+    for (auto& im : lv.covers) Image_free(&im);
+    lv.covers.clear();
+}
+
+static void buildLevelCovers(BrowseLevel& lv) {
+    freeLevelCovers(lv);
+    lv.covers.assign(lv.items.size(), C2D_Image{});
+    for (size_t i = 0; i < lv.coverData.size() && i < lv.covers.size(); i++)
+        if (!lv.coverData[i].empty())
+            Image_loadFromMemory(
+                reinterpret_cast<const unsigned char*>(lv.coverData[i].data()),
+                lv.coverData[i].size(), &lv.covers[i]);
+}
+
+// Network: list the parent's children, cache each cover's JPEG, build textures.
+static void pushLevel(const std::string& parentId, const std::string& title,
+                      ChildKind kind) {
+    if (!browseStack.empty()) freeLevelCovers(browseStack.back());
+
+    BrowseLevel lv;
+    lv.parentId    = parentId;
+    lv.title       = title;
+    lv.kind        = kind;
+    lv.items       = client.getChildren(parentId, kind);
+    // A series with no season grouping: fall back to a flat episode list so the
+    // user lands on episodes instead of an empty season grid.
+    if (kind == ChildKind::Seasons && lv.items.empty()) {
+        lv.kind  = ChildKind::EpisodesRecursive;
+        lv.items = client.getChildren(parentId, ChildKind::EpisodesRecursive);
+    }
+    lv.coverData.assign(lv.items.size(), std::string());
+    for (size_t i = 0; i < lv.items.size(); i++)
+        lv.coverData[i] = client.getPrimaryImage(lv.items[i].id, 200);
+    browseStack.push_back(std::move(lv));
+    buildLevelCovers(browseStack.back());
+}
+
+// Pop one level; rebuild the now-top level's textures from its cached bytes.
+static void popLevel() {
+    if (browseStack.empty()) return;
+    freeLevelCovers(browseStack.back());
+    browseStack.pop_back();
+    if (!browseStack.empty()) buildLevelCovers(browseStack.back());
+}
+
+static void clearBrowse() {
+    if (!browseStack.empty()) freeLevelCovers(browseStack.back());
+    browseStack.clear();
+}
+
 static std::string playerUrl;
-// Set just before entering STATE_PLAYER. playItem can come from either the item
-// list or the Continue Watching strip, so the player path is source-agnostic.
+// Set just before entering STATE_PLAYER. playItem can come from the item grid or
+// the Continue Watching strip, so the player path is source-agnostic.
 static JellyfinItem playItem;
 static double       playStartSec = 0.0;
 static AppState     playReturn   = STATE_ITEMS;
+// Target queued for a LOAD_DRILL (set when A is pressed on a series or season).
+static std::string  drillId, drillTitle;
+static ChildKind    drillKind = ChildKind::Seasons;
 static std::string pendingUsername;
 static std::string pendingPassword;
 
@@ -235,10 +306,15 @@ int main() {
                     break;
 
                 case LOAD_ITEMS:
-                    items      = client.getItems(libraries[selLib].id);
-                    selItem    = 0;
-                    itemOffset = 0;
-                    state      = STATE_ITEMS;
+                    clearBrowse();
+                    pushLevel(libraries[selLib].id, libraries[selLib].name,
+                              ChildKind::Direct);
+                    state = STATE_ITEMS;
+                    break;
+
+                case LOAD_DRILL:
+                    pushLevel(drillId, drillTitle, drillKind);
+                    state = STATE_ITEMS;
                     break;
 
                 default: break;
@@ -321,28 +397,59 @@ int main() {
                 break;
             }
 
-            case STATE_ITEMS:
-                if (kDown & KEY_B) { state = STATE_LIBRARIES; break; }
-                if (kDown & KEY_DOWN && selItem < (int)items.size() - 1) {
-                    selItem++;
-                    if (selItem >= itemOffset + UI::VISIBLE_ROWS) itemOffset++;
+            case STATE_ITEMS: {
+                if (kDown & KEY_B) {
+                    popLevel();
+                    if (browseStack.empty()) state = STATE_LIBRARIES;
+                    break;
                 }
-                if (kDown & KEY_UP && selItem > 0) {
-                    selItem--;
-                    if (selItem < itemOffset) itemOffset--;
-                }
-                if (kDown & KEY_A && !items.empty()) {
-                    playItem     = items[selItem];
-                    playStartSec = 0.0;
-                    playerUrl    = client.getStreamUrl(playItem.id);
-                    playReturn   = STATE_ITEMS;
-                    state        = STATE_PLAYER;
+
+                BrowseLevel& lv = browseStack.back();
+                int n    = (int)lv.items.size();
+                int cols = UI::ITEM_GRID_COLS;
+                if (kDown & KEY_RIGHT && lv.sel < n - 1 && (lv.sel % cols) != cols - 1) lv.sel++;
+                if (kDown & KEY_LEFT  && (lv.sel % cols) != 0)                          lv.sel--;
+                if (kDown & KEY_DOWN  && lv.sel + cols < n)                             lv.sel += cols;
+                if (kDown & KEY_UP    && lv.sel - cols >= 0)                            lv.sel -= cols;
+                // Keep the selected row within the visible window (offset in rows).
+                int selRow = lv.sel / cols;
+                if (selRow < lv.offset) lv.offset = selRow;
+                if (selRow >= lv.offset + UI::ITEM_GRID_ROWS_VISIBLE)
+                    lv.offset = selRow - UI::ITEM_GRID_ROWS_VISIBLE + 1;
+
+                if (kDown & KEY_A && n > 0) {
+                    JellyfinItem& it = lv.items[lv.sel];
+                    if (it.type == "Series") {
+                        // Drill into the series to list its seasons.
+                        drillId    = it.id;
+                        drillTitle = it.name;
+                        drillKind  = ChildKind::Seasons;
+                        loadMsg    = "Loading \"" + it.name + "\"...";
+                        pending    = LOAD_DRILL;
+                        state      = STATE_LOADING;
+                    } else if (it.type == "Season") {
+                        // Drill into the season to list its episodes.
+                        drillId    = it.id;
+                        drillTitle = lv.title + " - " + it.name;
+                        drillKind  = ChildKind::Episodes;
+                        loadMsg    = "Loading \"" + it.name + "\"...";
+                        pending    = LOAD_DRILL;
+                        state      = STATE_LOADING;
+                    } else {
+                        playItem     = it;
+                        playStartSec = it.resumeTicks / 10000000.0;
+                        playerUrl    = client.getStreamUrl(it.id, it.resumeTicks);
+                        playReturn   = STATE_ITEMS;
+                        state        = STATE_PLAYER;
+                    }
                 }
                 break;
+            }
 
             case STATE_PLAYER: {
                 freeLibCovers();      // textures live in VRAM that playback tears down
                 freeResumeCovers();
+                if (!browseStack.empty()) freeLevelCovers(browseStack.back());
                 C2D_Fini();
                 C3D_Fini();
 
@@ -361,6 +468,7 @@ int main() {
                 new (&ui) UI(topScreen, botScreen);
                 buildCoverTextures();    // rebuild from cached JPEG bytes (no re-fetch)
                 buildResumeTextures();
+                if (!browseStack.empty()) buildLevelCovers(browseStack.back());
                 state = playReturn;
                 break;
             }
@@ -396,10 +504,11 @@ int main() {
                                    resumeItems, resumeCovers,
                                    selResume, resumeOffset, resumeFocus);
                 break;
-            case STATE_ITEMS:
-                ui.drawItemList(items, selItem, itemOffset,
-                                libraries[selLib].name);
+            case STATE_ITEMS: {
+                BrowseLevel& lv = browseStack.back();
+                ui.drawItemGrid(lv.items, lv.covers, lv.sel, lv.offset, lv.title);
                 break;
+            }
             case STATE_PLAYER:
                 ui.drawPlayerScreen(playItem, playerUrl);
                 break;
@@ -413,6 +522,7 @@ int main() {
 
     freeLibCovers();
     freeResumeCovers();
+    clearBrowse();
     C2D_Fini();
     C3D_Fini();
     acExit();
