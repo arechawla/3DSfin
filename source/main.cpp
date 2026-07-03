@@ -187,12 +187,14 @@ static std::string pendingPassword;
 static const char* CFG_PATH = "/3ds/3dsfin/config.ini";
 static std::string cfgServer;
 static std::string cfgUsername;
+static std::string cfgPassword;
 
 static void saveConfig() {
     FILE* f = fopen(CFG_PATH, "w");
     if (!f) return;
     fprintf(f, "server=%s\n",   cfgServer.c_str());
     fprintf(f, "username=%s\n", cfgUsername.c_str());
+    fprintf(f, "password=%s\n", cfgPassword.c_str());
     fclose(f);
 }
 
@@ -205,6 +207,7 @@ static void loadConfig() {
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
         if (s.substr(0, 7)  == "server=")   cfgServer   = s.substr(7);
         if (s.substr(0, 9)  == "username=") cfgUsername = s.substr(9);
+        if (s.substr(0, 9)  == "password=") cfgPassword = s.substr(9);
     }
     fclose(f);
 }
@@ -285,6 +288,7 @@ int main() {
                         state = STATE_ERROR;
                     } else {
                         cfgUsername = pendingUsername;
+                        cfgPassword = pendingPassword;
                         saveConfig();
                         loadMsg = "Loading libraries...";
                         pending = LOAD_LIBRARIES;
@@ -344,7 +348,8 @@ int main() {
                     pendingUsername = swkbdRead("Username",
                         cfgUsername.empty() ? nullptr : cfgUsername.c_str());
                     if (pendingUsername.empty()) break;
-                    pendingPassword = swkbdRead("Password", nullptr, true);
+                    pendingPassword = swkbdRead("Password",
+                        cfgPassword.empty() ? nullptr : cfgPassword.c_str(), true);
                     if (pendingPassword.empty()) break;
                     loadMsg = "Connecting to " + cfgServer + "...";
                     pending = LOAD_CONNECT_AND_AUTH;
