@@ -7,9 +7,11 @@ namespace audio {
 // ─── Configuration ────────────────────────────────────────────────────────────
 // One AAC frame decodes to 1024 PCM samples (2048 with SBR upsampling). Size each
 // wave buffer for the worst case (2048 stereo frames) so a single decoded frame
-// always fits. NUM_WBUF buffers give a few hundred ms of queued lookahead, which
-// covers the gaps while the main thread is busy pacing/blitting video.
-static constexpr int   NUM_WBUF      = 16;
+// always fits. NUM_WBUF buffers give several hundred ms of queued lookahead: the
+// steady-state queue depth is only ~AV_LEAD_MS (the pacer holds video that far
+// ahead of audio playback), but demux bursts (startup, post-stall catch-up) queue
+// well past it and every drop is an audible gap, so keep generous headroom.
+static constexpr int   NUM_WBUF      = 32;
 static constexpr int   MAX_FRAMES    = 2048;        // per-channel samples per buffer
 static constexpr int   MAX_CHANS     = 2;
 static constexpr u32   WBUF_BYTES    = MAX_FRAMES * MAX_CHANS * sizeof(int16_t);
@@ -21,7 +23,9 @@ static int           g_rate       = 0;
 static int           g_chans      = 0;
 static ndspWaveBuf   g_wbuf[NUM_WBUF];
 static int16_t*      g_mem[NUM_WBUF] = {0};
+static double        g_bufPts[NUM_WBUF];            // PTS (sec) of each buffer's first sample
 static int           g_next       = 0;              // round-robin search start
+static unsigned      g_dropped    = 0;              // blocks dropped since init()
 
 bool init() {
     if (g_enabled) return true;
@@ -38,7 +42,9 @@ bool init() {
         memset(&g_wbuf[i], 0, sizeof(ndspWaveBuf));
         g_wbuf[i].data_pcm16 = g_mem[i];
         g_wbuf[i].status     = NDSP_WBUF_DONE;       // mark free for the first push
+        g_bufPts[i]          = -1.0;
     }
+    g_dropped = 0;
     g_enabled = true;
     return true;
 }
@@ -69,7 +75,7 @@ void configure(int sampleRate, int channels) {
 
 bool ready() { return g_enabled && g_configured; }
 
-void push(const int16_t* pcm, int samplesPerChan, int channels) {
+void push(const int16_t* pcm, int samplesPerChan, int channels, double ptsSec) {
     if (!g_configured || samplesPerChan <= 0) return;
     if (channels < 1) channels = 1;
     if (channels > MAX_CHANS) channels = MAX_CHANS;
@@ -84,7 +90,7 @@ void push(const int16_t* pcm, int samplesPerChan, int channels) {
             break;
         }
     }
-    if (idx < 0) return;                              // all queued → drop this block
+    if (idx < 0) { g_dropped++; return; }             // all queued → drop this block
     g_next = (idx + 1) % NUM_WBUF;
 
     u32 bytes = (u32)samplesPerChan * channels * sizeof(int16_t);
@@ -94,7 +100,46 @@ void push(const int16_t* pcm, int samplesPerChan, int channels) {
     g_wbuf[idx].data_pcm16 = g_mem[idx];
     g_wbuf[idx].nsamples   = samplesPerChan;         // per-channel frame count
     g_wbuf[idx].looping    = false;
+    g_bufPts[idx]          = ptsSec;
     ndspChnWaveBufAdd(AUDIO_CHN, &g_wbuf[idx]);
+}
+
+int queuedBufs() {
+    int n = 0;
+    for (int i = 0; i < NUM_WBUF; i++)
+        if (g_wbuf[i].status == NDSP_WBUF_QUEUED || g_wbuf[i].status == NDSP_WBUF_PLAYING)
+            n++;
+    return n;
+}
+
+unsigned droppedBlocks() { return g_dropped; }
+
+void flushQueue() {
+    if (!g_enabled) return;
+    ndspChnWaveBufClear(AUDIO_CHN);
+    // After the clear ndsp forgets these buffers, so it will never flip their
+    // status back to DONE itself — mark them free by hand. Worst case the DSP is
+    // mid-mix on one of them and a subsequent push overwrites it: one brief
+    // glitch, on a path that runs at most once per playback.
+    for (int i = 0; i < NUM_WBUF; i++) {
+        g_wbuf[i].status = NDSP_WBUF_DONE;
+        g_bufPts[i]      = -1.0;
+    }
+}
+
+double audioClock() {
+    if (!g_configured || g_rate <= 0) return -1.0;
+    // The ndsp thread flips buffer status asynchronously; a read racing a buffer
+    // transition can pair the sample position with the wrong buffer's PTS, but the
+    // resulting error is bounded by one buffer (~20-40 ms) and the caller only uses
+    // this clock through a heavily damped correction, so no locking is needed.
+    for (int i = 0; i < NUM_WBUF; i++) {
+        if (g_wbuf[i].status == NDSP_WBUF_PLAYING) {
+            if (g_bufPts[i] < 0) return -1.0;        // buffer pushed without a PTS
+            return g_bufPts[i] + (double)ndspChnGetSamplePos(AUDIO_CHN) / (double)g_rate;
+        }
+    }
+    return -1.0;                                     // idle/underrun: no sample playing
 }
 
 void exit() {

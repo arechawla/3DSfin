@@ -223,37 +223,118 @@ static void blitFrame(const u8* mvdOut, u32 frameCount) {
 // Mirrors to the on-screen console (only when debug is enabled) and always to file.
 #define DLOG(dbg, ...) do { if (g_dbg) printf(__VA_ARGS__); if(dbg){fprintf(dbg,__VA_ARGS__);fflush(dbg);} } while(0)
 
-// ─── PTS-based frame pacing ───────────────────────────────────────────────────
-// Without pacing, frames blit as fast as they decode, which is bursty: HTTP
-// delivers data in chunks, each holding several frames, so playback fast-forwards
-// through a burst (one vblank per frame) then freezes waiting for the next chunk.
-// We anchor wall-clock time to the first displayed frame's PTS and, before every
-// later frame, sleep until its scheduled presentation time. When decode can't keep
-// up (now is already past target) nothing sleeps, so we never play slower than the
-// hardware allows — pacing only smooths the too-fast bursts.
-static long long g_pacePts0  = -1;   // 90 kHz PTS of the first displayed frame
-static u64       g_paceWall0 = 0;    // osGetTime() (ms) captured at that first frame
-static void paceToPts(long long auPts) {
-    if (auPts < 0) return;                            // no PTS on this AU → can't pace
-    if (g_pacePts0 < 0) {                             // first frame: set the anchor
-        g_pacePts0 = auPts; g_paceWall0 = osGetTime();
-        return;
-    }
-    long long dpts = auPts - g_pacePts0;
-    if (dpts < 0) dpts += (1LL << 33);                // 33-bit PTS wraparound
-    u64 target = g_paceWall0 + (u64)(dpts / 90);      // 90 kHz ticks → ms
-    u64 now    = osGetTime();
-    if (target > now) {                               // ahead of schedule → wait
-        u64 waitMs = target - now;
-        if (waitMs > 1000) waitMs = 1000;             // cap: PTS-discontinuity safety
-        DBG("pace %lums\n", (unsigned long)waitMs);
-        svcSleepThread((s64)waitMs * 1000000LL);
-    } else if (now - target > 200) {
-        // Fell well behind (network stall starved the decoder). Don't race to catch
-        // up — that dumps the backlog at max speed and looks like a fast-forward
-        // shake. Re-anchor the clock to "now" and resume smooth pacing from here.
-        g_pacePts0 = auPts; g_paceWall0 = now;
-        DBG("pace resync\n");
+// ─── Decoded-frame FIFO + display scheduler ──────────────────────────────────
+// Decode and display are decoupled: MVD writes each frame into a slot of this
+// FIFO and the demux keeps running ahead (bounded by the slot count), while
+// displayPump() blits each frame only when its presentation time arrives.
+//
+// The previous design paced inside the decoder, so display, demux and the audio
+// feed all stalled together on every pacing sleep. That made A/V sync impossible
+// to close: holding video to let audio catch up also halted the demux that
+// delivers said audio, so the ndsp queue starved, underrunning in a ~0.5s
+// snap/underrun/snap stutter cycle (confirmed on hardware via the sync log).
+// With the FIFO, the demux runs up to ~0.7s ahead of the screen, which keeps the
+// ndsp queue deep and absorbs the muxer's A/V interleave skew (audio PES for a
+// given moment arrive later in the stream than the video PES for that moment).
+//
+// Frame timing comes from a smooth wall-clock anchor, *disciplined* against
+// audio::audioClock() — the program-time PTS of the sample the DSP is playing
+// right now, on the same 90 kHz axis as video PTS: small error → anchor slew of
+// at most ±2 ms/frame (drift-proof, immune to DSP clock jitter); large error
+// (resume start, stall recovery) → one anchor snap, then locked. Frame timing is
+// never taken directly from the DSP clock — that was tried and stuttered. All
+// anchor math is signed (s64): audio behind video makes intermediate values
+// negative, and u64 arithmetic underflowed there.
+static constexpr int FIFO_MAX = 16;
+struct VidFrame { u8* buf; long long pts; };
+static VidFrame  g_fifo[FIFO_MAX];
+static int       g_fifoN     = 0;      // slots successfully allocated
+static int       g_fifoHead  = 0;      // next frame to display
+static int       g_fifoLen   = 0;      // decoded frames waiting
+static u32       g_dispCount = 0;      // frames blitted so far
+static long long g_lastBlitPts = -1;   // PTS on screen (stale-audio reference)
+static long long g_vidFirstPts = -1;   // first video PTS demuxed (stale-audio ref at start)
+
+static long long g_pacePts0  = -1;     // 90 kHz PTS of the anchor frame
+static s64       g_paceWall0 = 0;      // osGetTime() (ms) scheduled for the anchor PTS
+static FILE*     g_paceLog   = nullptr;   // sync-state log (player_debug.txt), for tuning
+static u32       g_paceFrames = 0;
+
+static void freeFifoSlots() {
+    for (int i = 0; i < g_fifoN; i++) { linearFree(g_fifo[i].buf); g_fifo[i].buf = nullptr; }
+    g_fifoN = 0;
+}
+
+static void blitHead(FILE* dbg) {
+    VidFrame& f = g_fifo[g_fifoHead];
+    blitFrame(f.buf, g_dispCount);
+    g_dispCount++;
+    if (f.pts >= 0) g_lastBlitPts = f.pts;
+    g_fifoHead = (g_fifoHead + 1) % g_fifoN;
+    g_fifoLen--;
+    if (g_dispCount <= 5) DLOG(dbg, "frame %u\n", (unsigned)g_dispCount);
+}
+
+// Blit every frame whose presentation time has arrived. waitFree additionally
+// blocks (napping in 20ms slices) until a FIFO slot is free for the decoder;
+// drain blocks until the FIFO is empty (end of stream). The naps hand the core
+// to the download thread, so waiting here never starves the network side.
+static void displayPump(bool waitFree, bool drain, bool* stop, FILE* dbg) {
+    while (g_fifoLen > 0 && !*stop) {
+        long long pts = g_fifo[g_fifoHead].pts;
+        if (pts < 0) { blitHead(dbg); continue; }      // unstamped AU: show immediately
+        s64 now = (s64)osGetTime();
+        if (g_pacePts0 < 0) {                          // first frame anchors the clock
+            g_pacePts0 = pts; g_paceWall0 = now;
+            blitHead(dbg);
+            continue;
+        }
+        long long dpts = pts - g_pacePts0;
+        if (dpts < 0) dpts += (1LL << 33);             // 33-bit PTS wraparound
+        s64 target = g_paceWall0 + dpts / 90;          // 90 kHz ticks → ms
+        if (now < target) {                            // head frame not due yet
+            if (!drain && !(waitFree && g_fifoLen >= g_fifoN)) return;
+            s64 nap = target - now;
+            if (nap > 20) nap = 20;
+            svcSleepThread(nap * 1000000LL);
+            hidScanInput();
+            if (hidKeysDown() & KEY_B) { *stop = true; return; }
+            continue;
+        }
+
+        // Frame is due. Audio-clock servo: err > 0 = video presenting early
+        // (audio behind), err < 0 = video late.
+        double ac = audio::audioClock();
+        s64 errMs = 0;
+        if (ac >= 0) {
+            errMs = (s64)((pts / 90000.0 - ac) * 1000.0);
+            if (errMs > 300 || errMs < -300) {
+                if (errMs > 1500) errMs = 1500;        // bound the hold on wild PTS gaps
+                g_paceWall0 = now + errMs - dpts / 90;
+                if (g_paceLog) { fprintf(g_paceLog, "sync snap err=%lldms\n", (long long)errMs); fflush(g_paceLog); }
+                if (errMs > 0) continue;               // target moved ahead → wait again
+            } else {
+                s64 slew = errMs / 8;                  // heavy damping: absorbs clock jitter
+                if (slew >  2) slew =  2;              // imperceptible per frame
+                if (slew < -2) slew = -2;
+                g_paceWall0 += slew;
+            }
+        } else if (now - target > 200) {
+            // No audio clock (no track, missing dsp_firm, underrun) and we fell
+            // well behind: re-anchor instead of racing through the backlog.
+            g_pacePts0 = pts; g_paceWall0 = now;
+            DBG("pace resync\n");
+        }
+        if (g_paceLog && (++g_paceFrames % 240) == 0) {
+            if (ac >= 0)
+                fprintf(g_paceLog, "sync err=%+lldms q=%d drops=%u fifo=%d\n",
+                        (long long)errMs, audio::queuedBufs(), audio::droppedBlocks(), g_fifoLen);
+            else
+                fprintf(g_paceLog, "sync noclock q=%d drops=%u fifo=%d\n",
+                        audio::queuedBufs(), audio::droppedBlocks(), g_fifoLen);
+            fflush(g_paceLog);
+        }
+        blitHead(dbg);
     }
 }
 
@@ -413,7 +494,7 @@ static bool parseSPS(const u8* nal, u32 len, u32* outW, u32* outH) {
 //   4. The frame is usually written during process(); check sentinels first and
 //      only fall back to polling mvdstdRenderVideoFrame() if nothing appeared.
 static void processH264(u8* pes, u32 pesLen,
-                        u8* feedBuf, u8* mvdOut,
+                        u8* feedBuf,
                         MVDSTD_Config* cfg, bool* first,
                         bool* stop, u32* frameCount, FILE* dbg, long long auPts) {
     (void)first;
@@ -455,10 +536,9 @@ static void processH264(u8* pes, u32 pesLen,
                 (w != g_decW || h != g_decH)) {
                 g_decW = w; g_decH = h;
                 bufSz  = g_decW * g_decH * 2;
+                // Output physaddr is re-pointed at a FIFO slot before every VCL.
                 mvdstdGenerateDefaultConfig(cfg, g_decW, g_decH, g_decW, g_decH,
                                             nullptr, nullptr, nullptr);
-                cfg->physaddr_outdata0 = osConvertVirtToPhys(mvdOut);
-                cfg->physaddr_outdata1 = osConvertVirtToPhys(mvdOut);
                 DLOG(dbg, "SPS dims=%lux%lu (reconfigured MVD)\n",
                      (unsigned long)g_decW, (unsigned long)g_decH);
             }
@@ -472,9 +552,17 @@ static void processH264(u8* pes, u32 pesLen,
 
         bool isVCL = (nalType >= 1 && nalType <= 5);
 
-        if (isVCL) {                         // arm output buffer just before a frame NAL
-            mvdSetSentinels(mvdOut);
-            GSPGPU_FlushDataCache(mvdOut, bufSz);
+        u8* slot = nullptr;
+        if (isVCL) {                         // arm a FIFO slot just before a frame NAL
+            // If the FIFO is full, display due frames until a slot frees up —
+            // this is where playback speed is regulated now (backpressure).
+            if (g_fifoLen >= g_fifoN) displayPump(true, false, stop, dbg);
+            if (*stop) return;
+            slot = g_fifo[(g_fifoHead + g_fifoLen) % g_fifoN].buf;
+            cfg->physaddr_outdata0 = osConvertVirtToPhys(slot);
+            cfg->physaddr_outdata1 = osConvertVirtToPhys(slot);
+            mvdSetSentinels(slot);
+            GSPGPU_FlushDataCache(slot, bufSz);
             MVDSTD_SetConfig(cfg);
         }
 
@@ -487,23 +575,24 @@ static void processH264(u8* pes, u32 pesLen,
 
         if (!isVCL) continue;                // parameter sets / SEI: no frame to render
 
-        // Render the decoded frame into mvdOut (NULL = no re-SetConfig, patched mvd.c)
+        // Render the decoded frame into the slot (NULL = no re-SetConfig, patched mvd.c)
         bool got = false;
         Result rr = (Result)MVD_STATUS_BUSY;
         for (int i = 0; i < 256; i++) {
             rr = mvdstdRenderVideoFrame(nullptr, false);
-            GSPGPU_InvalidateDataCache(mvdOut, bufSz);
-            if (mvdSentinelsChanged(mvdOut)) { got = true; break; }
+            GSPGPU_InvalidateDataCache(slot, bufSz);
+            if (mvdSentinelsChanged(slot)) { got = true; break; }
             if (rr != (Result)MVD_STATUS_BUSY) break;
         }
         if (log) DLOG(dbg, " rend=%08lX got=%d px=%02X%02X\n",
-                     (unsigned long)rr, (int)got, mvdOut[0], mvdOut[1]);
+                     (unsigned long)rr, (int)got, slot[0], slot[1]);
 
         if (got) {
-            paceToPts(auPts);            // sleep until this frame's presentation time
-            blitFrame(mvdOut, *frameCount);
+            g_fifo[(g_fifoHead + g_fifoLen) % g_fifoN].pts = auPts;
+            g_fifoLen++;
             (*frameCount)++;
-            if (*frameCount <= 5) DLOG(dbg, "frame %u\n", (unsigned)*frameCount);
+            if (*frameCount <= 5) DLOG(dbg, "dec %u\n", (unsigned)*frameCount);
+            displayPump(false, false, stop, dbg);   // show whatever is due
         }
         hidScanInput();
         if (hidKeysDown() & KEY_B) { *stop = true; return; }
@@ -514,9 +603,12 @@ static void processH264(u8* pes, u32 pesLen,
 // The audio elementary stream is AAC-LC in ADTS framing (Jellyfin's AudioCodec=aac
 // inside an MPEG-TS). Each completed audio PES holds one or more ADTS frames; we
 // locate each syncword, decode it to interleaved PCM16 with Helix, and hand the
-// PCM to ndsp. The DSP then plays it asynchronously while the main thread paces
-// video — so audio runs free for now (tight A/V sync is a later refinement).
+// PCM to ndsp tagged with its program-time PTS. The PES header carries the PTS of
+// the first ADTS frame in the PES; g_audNextPts walks it forward by each frame's
+// duration so every pushed block is tagged, which is what lets audio::audioClock()
+// report true playback position for the video pacer's servo.
 static HAACDecoder g_aac = nullptr;
+static double      g_audNextPts = -1.0;   // PTS (sec) of the next ADTS frame decoded
 // One ADTS frame decodes to at most 2048 samples/channel (1024 LC, doubled by SBR)
 // × 2 channels = 4096 interleaved shorts.
 static short       g_pcm[2048 * 2];
@@ -545,7 +637,19 @@ static void processAAC(unsigned char* buf, int len, FILE* dbg) {
             audio::configure(fi.sampRateOut, fi.nChans);
             if (dbg) { fprintf(dbg, "AAC cfg: %d Hz x%d ch\n", fi.sampRateOut, fi.nChans); fflush(dbg); }
         }
-        audio::push(g_pcm, fi.outputSamps / fi.nChans, fi.nChans);
+        int spc = fi.outputSamps / fi.nChans;
+        // Resumed transcodes prime the mux with audio from before the video's
+        // start point (seen ~2.8s of it on hardware); queueing that puts audio
+        // seconds behind for the whole session. Skip blocks that predate what is
+        // (or will first be) on screen. Reference is the displayed frame once one
+        // exists, else the first demuxed video PTS.
+        long long vref = (g_lastBlitPts >= 0) ? g_lastBlitPts : g_vidFirstPts;
+        bool stale = (g_audNextPts >= 0.0 && vref >= 0 &&
+                      g_audNextPts < vref / 90000.0 - 0.5);
+        if (!stale)
+            audio::push(g_pcm, spc, fi.nChans, g_audNextPts);
+        if (g_audNextPts >= 0.0 && fi.sampRateOut > 0)
+            g_audNextPts += (double)spc / (double)fi.sampRateOut;
         if (++frames <= 3 && dbg) { fprintf(dbg, "AAC frame %u samps=%d\n", (unsigned)frames, fi.outputSamps); fflush(dbg); }
     }
 }
@@ -589,28 +693,42 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         fflush(dbg);
     }
 
-    // Linear memory buffers (g_ring.data is the background download ring)
+    // Linear memory buffers (g_ring.data is the background download ring).
+    // Frame FIFO slots are allocated best-effort — each holds one full-size
+    // BGR565 frame; fewer slots just means less decode-ahead.
     g_ring.data = (u8*)linearAlloc(RING_SZ);
     u8* pesBuf  = (u8*)linearAlloc(PES_SZ);
     u8* nalBuf  = (u8*)linearAlloc(NAL_SZ);
-    u8* mvdOut  = (u8*)linearAlloc(VID_W * VID_H * 2);
     u8* audBuf  = (u8*)linearAlloc(PES_SZ);   // audio PES accumulator (ADTS frames)
+    g_fifoN = 0;
+    for (int i = 0; i < FIFO_MAX; i++) {
+        g_fifo[i].buf = (u8*)linearAlloc(VID_W * VID_H * 2);
+        if (!g_fifo[i].buf) break;
+        g_fifo[i].pts = -1;
+        g_fifoN++;
+    }
 
-    if (!g_ring.data || !pesBuf || !nalBuf || !mvdOut || !audBuf) {
+    if (!g_ring.data || !pesBuf || !nalBuf || !audBuf || g_fifoN < 4) {
         printf("alloc failed\n");
-        if (dbg) { fprintf(dbg, "alloc failed\n"); fclose(dbg); }
+        if (dbg) { fprintf(dbg, "alloc failed (fifo=%d)\n", g_fifoN); fclose(dbg); }
         linearFree(g_ring.data); linearFree(pesBuf);
-        linearFree(nalBuf); linearFree(mvdOut); linearFree(audBuf);
+        linearFree(nalBuf); linearFree(audBuf);
+        freeFifoSlots();
         svcSleepThread(3000000000LL);
         return false;
     }
-    DBG("Buffers OK\n");
+    DBG("Buffers OK (fifo=%d)\n", g_fifoN);
 
     // Reset coded dims to the max so the first SPS always triggers reconfigure.
     g_decW = VID_W; g_decH = VID_H;
 
-    // Reset the frame-pacing anchor (set on the first displayed frame below).
+    // Reset the frame-pacing anchor (set on the first displayed frame below),
+    // the audio PTS walker (set from the first audio PES header), and FIFO state.
     g_pacePts0 = -1; g_paceWall0 = 0;
+    g_audNextPts = -1.0;
+    g_paceLog = dbg; g_paceFrames = 0;
+    g_fifoHead = 0; g_fifoLen = 0; g_dispCount = 0;
+    g_lastBlitPts = -1; g_vidFirstPts = -1;
 
     // Init MVD hardware decoder
     Result mvdRet = mvdstdInit(MVDMODE_VIDEOPROCESSING,
@@ -620,7 +738,8 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         printf("mvdstdInit fail: 0x%08X\n", (unsigned)mvdRet);
         if (dbg) { fprintf(dbg, "mvdstdInit fail: 0x%08X\n", (unsigned)mvdRet); fclose(dbg); }
         linearFree(g_ring.data); linearFree(pesBuf);
-        linearFree(nalBuf); linearFree(mvdOut);
+        linearFree(nalBuf); linearFree(audBuf);
+        freeFifoSlots();
         svcSleepThread(3000000000LL);
         return false;
     }
@@ -629,12 +748,12 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     MVDSTD_Config mvdCfg;
     mvdstdGenerateDefaultConfig(&mvdCfg, VID_W, VID_H, VID_W, VID_H,
                                 nullptr, nullptr, nullptr);
-    mvdCfg.physaddr_outdata0 = osConvertVirtToPhys(mvdOut);
-    mvdCfg.physaddr_outdata1 = osConvertVirtToPhys(mvdOut);
+    mvdCfg.physaddr_outdata0 = osConvertVirtToPhys(g_fifo[0].buf);
+    mvdCfg.physaddr_outdata1 = osConvertVirtToPhys(g_fifo[0].buf);
     MVDSTD_SetConfig(&mvdCfg);
-    DLOG(dbg, "mvdOut virt=%08lX phys=%08lX\n",
-         (unsigned long)mvdOut,
-         (unsigned long)mvdCfg.physaddr_outdata0);
+    DLOG(dbg, "fifo[0] virt=%08lX phys=%08lX slots=%d\n",
+         (unsigned long)g_fifo[0].buf,
+         (unsigned long)mvdCfg.physaddr_outdata0, g_fifoN);
 
     // Override probe: stock libctru returns -1 (FFFFFFFF) for a NULL config;
     // our vendored/patched mvd.c allows NULL. This single line proves which
@@ -669,12 +788,14 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
 
     if (!ok) {
         printf("HTTP fail, B to exit\n");
+        g_paceLog = nullptr;
         if (dbg) fclose(dbg);
         AACFreeDecoder(g_aac); g_aac = nullptr;
         audio::exit();
         mvdstdExit();
         linearFree(g_ring.data); linearFree(pesBuf);
-        linearFree(nalBuf); linearFree(mvdOut); linearFree(audBuf);
+        linearFree(nalBuf); linearFree(audBuf);
+        freeFifoSlots();
         // Wait for B so user can read the error
         while (aptMainLoop()) {
             hidScanInput();
@@ -699,6 +820,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     u32  pktCount   = 0;
 
     bool dbgComboPrev = false;   // edge-detect for the X + D-Pad Up debug toggle
+    bool prodDoneLogged = false; // one-time log when the download stream ends
 
     // Seek-bar state: position from PES PTS, total from the Jellyfin item.
     double    durSec      = runTimeTicks > 0 ? runTimeTicks / 10000000.0 : 0.0;
@@ -801,6 +923,11 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                 if (pusi) {
                     if (audActive && audLen > 0)
                         processAAC(audBuf, (int)audLen, dbg);
+                    // PES PTS = presentation time of the first ADTS frame starting
+                    // here; re-syncs g_audNextPts each PES so per-frame accumulation
+                    // error (or dropped/corrupt frames) can't build up.
+                    long long apts = pesPTS(pay, psz);
+                    if (apts >= 0) g_audNextPts = apts / 90000.0;
                     int skip = pesHeaderLen(pay, psz);
                     audLen = 0; audActive = true;
                     int cp = psz - skip;
@@ -812,13 +939,26 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                 if (pusi) {
                     long long pts = pesPTS(pay, psz);
                     if (pts >= 0) {
-                        if (firstPts < 0) firstPts = pts;
+                        if (firstPts < 0) {
+                            firstPts = pts;
+                            g_vidFirstPts = pts;
+                            // Audio demuxed before the first video PES is stale
+                            // resume priming if it runs well behind the video
+                            // start — purge it or playback begins seconds
+                            // desynced. Harmless no-op on aligned streams.
+                            if (g_audNextPts >= 0.0 &&
+                                g_audNextPts < pts / 90000.0 - 0.5) {
+                                audio::flushQueue();
+                                if (dbg) { fprintf(dbg, "flushed stale audio (aud=%.2f vid=%.2f)\n",
+                                                   g_audNextPts, pts / 90000.0); fflush(dbg); }
+                            }
+                        }
                         long long d = pts - firstPts;
                         if (d < 0) d += (1LL << 33);   // 33-bit PTS wraparound
                         posSec = startSec + d / 90000.0;
                     }
                     if (pesActive && pesLen > 0)
-                        processH264(pesBuf,pesLen,nalBuf,mvdOut,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg,curPesPts);
+                        processH264(pesBuf,pesLen,nalBuf,&mvdCfg,&mvdFirst,&stop,&frameCount,dbg,curPesPts);
                     curPesPts = pts;   // PTS now belongs to the AU starting here
                     int skip = pesHeaderLen(pay,psz);
                     pesLen = 0; pesActive = true;
@@ -828,6 +968,18 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                     memcpy(pesBuf+pesLen,pay,psz); pesLen+=psz;
                 }
             }
+        }
+
+        // Display any frames that came due (also keeps video moving through
+        // network stalls, when the batch loop above has nothing to decode).
+        displayPump(false, false, &stop, dbg);
+
+        // One-time note when the download stream ends — distinguishes a normal
+        // end-of-file from the server silently stopping mid-stream (throttling).
+        if (g_ring.producerDone && !prodDoneLogged) {
+            prodDoneLogged = true;
+            if (dbg) { fprintf(dbg, "producer done: pkts=%u used=%u\n",
+                               (unsigned)pktCount, (unsigned)ringUsed()); fflush(dbg); }
         }
 
         // Buffering indicator: clear once frames flow again, re-show on underrun.
@@ -852,10 +1004,15 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         if (processed == 0) svcSleepThread(5000000LL);   // 5ms
     }
 
+    // Show whatever is still queued at its proper pace before tearing down.
+    if (!stop) displayPump(false, true, &stop, dbg);
+
     DBG("End: pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
+    g_paceLog = nullptr;
     if (dbg) {
-        fprintf(dbg,"End: pkts=%u pmtPid=%d vidPid=%d frames=%u\n",
-                (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount);
+        fprintf(dbg,"End: pkts=%u pmtPid=%d vidPid=%d dec=%u disp=%u\n",
+                (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount,
+                (unsigned)g_dispCount);
         fclose(dbg);
     }
 
@@ -873,6 +1030,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     audio::exit();
     mvdstdExit();
     linearFree(g_ring.data); linearFree(pesBuf);
-    linearFree(nalBuf); linearFree(mvdOut); linearFree(audBuf);
+    linearFree(nalBuf); linearFree(audBuf);
+    freeFifoSlots();
     return true;
 }
