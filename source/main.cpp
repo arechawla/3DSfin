@@ -479,6 +479,16 @@ int main() {
                     }
                 } while (seekTo >= 0);
 
+                // playerPlay's consoleInit(GFX_BOTTOM) switched that screen to
+                // RGB565 + single-buffered and libctru never restores it, so
+                // citro2d would transfer RGB8 pixels into a framebuffer GSP
+                // still reads as 16-bit — the garbled bottom screen after
+                // playback. Put back what gfxInitDefault set before C2D takes
+                // the screen again (this reallocates the framebuffers, so it
+                // must happen before C2D_CreateScreenTarget grabs pointers).
+                gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
+                gfxSetDoubleBuffering(GFX_BOTTOM, true);
+
                 C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
                 C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
                 C2D_Prepare();
