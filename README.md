@@ -1,5 +1,7 @@
 # 3DSFin
-3DSfin is a *work in progress* jellyfin client for New Nintendo 3DS.
+**Video and audio playback of your entire jellyfin catalog, on your new 3ds!**
+
+3DSfin is a *work in progress* jellyfin client for New Nintendo 3DS. 
 
 
 ## Install 
@@ -37,13 +39,15 @@ Full Library Catalog can be browsed:
 ![Screenshot](mainscreennew.jpg)
 Browsing Within Library:
 ![Screenshot](librarybrowse.jpg)
+Playback:
+![Screenshot](playback.jpg)
 
 
 
 ## Current Status
-3DSfin is in very early development, with full video playback **not supported** as of yet. As of the latest release, 3DSfin suports the following features:
+3DSfin is in very early development. 3DSfin suports the following features:
+- Video Playback and Audio Playback of your jellyfin library.
 - Server Adding: Enter your jellyfin server URL via the on-screen keyboard
-- Authentication: Login with your Jellyfin username and password
 - Full Library Browsing: Scrollable list of all your Jellyfin Libraries. Browse
 - Metadata Viwe: Displays title, year, duration, and media type
 - Stream URL retrieval: Requests a server-transcoded H.264/AAC MPEG-TS stream at 400×240 (240p) and 1.5 Mbps
