@@ -306,7 +306,10 @@ void UI::drawLibraryGrid(const std::vector<JellyfinLibrary>& libs,
         int   c = i % cols, r = i / cols;
         float x = mx + c * (cardW + gap);
         float y = my + r * pitchY;
-        bool  sel = (idx == selected);
+        // Only the focused screen shows a selection: once the d-pad moves down
+        // into the resume strip, the grid drops its outline (mirrors the way
+        // drawResumeStrip gates its own highlight on focus).
+        bool  sel = !resumeFocus && idx == selected;
 
         if (sel) drawRect(x - 3, y - 3, cardW + 6, cardH + 6, COL_SEL);
 
