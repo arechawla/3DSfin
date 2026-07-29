@@ -106,7 +106,17 @@ static long long pesPTS(const u8* pay, int sz) {
          | ((long long)((pay[13] >> 1) & 0x7F));
 }
 
-// ─── Seek bar (bottom-screen text console) ───────────────────────────────────
+// ─── Bottom-screen info block (text console: 30 rows x 40 cols) ──────────────
+// The block sits at the top of the screen. Metadata grows downward from
+// ROW_META and is at most 6 rows (series + blank + 2 title lines + blank +
+// year), so everything below it keeps a fixed row — the bar doesn't shift when
+// a title wraps or a movie has no series name. Text spans cols 5..38.
+static constexpr int ROW_STATUS = 1;    // "Buffering..." / "Seeking..."
+static constexpr int ROW_META   = 3;    // series / title / year, rows 3..8
+static constexpr int ROW_TIME   = 10;   // "MM:SS / MM:SS"    + "B EXIT"
+static constexpr int ROW_BAR    = 12;   // "[####--------]"
+static constexpr int ROW_HINTS  = 13;   // "<< -10s  D-PAD  +30s >>"
+
 static void fmtTime(char* buf, size_t n, double sec) {
     if (sec < 0) sec = 0;
     int t = (int)(sec + 0.5);
@@ -115,7 +125,7 @@ static void fmtTime(char* buf, size_t n, double sec) {
     else       snprintf(buf, n, "%02d:%02d", m, s);
 }
 
-// Draws "MM:SS / MM:SS" and a [####----] bar near the bottom of the console.
+// Draws "MM:SS / MM:SS" and a [####----] bar under the metadata.
 // Uses ANSI cursor positioning so it updates in place (no scrolling).
 static void drawSeekBar(double posSec, double durSec) {
     const int barW = 28;
@@ -135,27 +145,27 @@ static void drawSeekBar(double posSec, double durSec) {
     if (durSec > 0) {
         char tot[16];
         fmtTime(tot, sizeof(tot), durSec);
-        printf("\x1b[27;5H%s / %s    ", cur, tot);   // trailing spaces clear leftovers
+        printf("\x1b[%d;5H%s / %s    ", ROW_TIME, cur, tot);  // spaces clear leftovers
     } else {
-        printf("\x1b[27;5H%s    ", cur);             // unknown duration
+        printf("\x1b[%d;5H%s    ", ROW_TIME, cur);            // unknown duration
     }
-    printf("\x1b[29;5H[%s]", bar);
+    printf("\x1b[%d;5H[%s]", ROW_BAR, bar);
 }
 
-// Button hints. Skips go on the last console row, under the ends of the seek bar
-// (which spans cols 5..34) so each label sits on the side it seeks toward; exit
-// goes opposite the timecode on row 27, past the space drawSeekBar rewrites.
+// Button hints. Skips go directly under the seek bar (which spans cols 5..34)
+// so each label sits on the side it seeks toward; exit goes opposite the
+// timecode, past the space drawSeekBar rewrites.
 // Static: drawn once alongside drawMeta, redrawn when the debug overlay closes.
 static void drawControls() {
-    printf("\x1b[27;29HB EXIT");
-    printf("\x1b[30;5H<< -10s");
-    printf("\x1b[30;17HD-PAD");
-    printf("\x1b[30;28H+30s >>");
+    printf("\x1b[%d;29HB EXIT",  ROW_TIME);
+    printf("\x1b[%d;5H<< -10s",  ROW_HINTS);
+    printf("\x1b[%d;17HD-PAD",   ROW_HINTS);
+    printf("\x1b[%d;28H+30s >>", ROW_HINTS);
 }
 
-// Series name / episode title / year above the seek bar, one blank line between
-// each item. A long title wraps to a second line instead of being truncated.
-// The block is bottom-anchored so it always ends just above the seek bar.
+// Series name / episode title / year at the top of the screen, one blank line
+// between each item. A long title wraps to a second line instead of being
+// truncated. Grows downward from ROW_META; at most 6 rows.
 static void drawMeta(const std::string& series, const std::string& title, int year) {
     const size_t W = 34;   // console text width (col 5 .. 38)
 
@@ -174,13 +184,7 @@ static void drawMeta(const std::string& series, const std::string& title, int ye
         if (t2.size() > W) t2 = t2.substr(0, W - 3) + "...";
     }
 
-    int titleLines = title.empty() ? 0 : (t2.empty() ? 1 : 2);
-    int present    = (series.empty() ? 0 : 1) + (title.empty() ? 0 : 1) + (year > 0 ? 1 : 0);
-    int contentRows = (series.empty() ? 0 : 1) + titleLines + (year > 0 ? 1 : 0);
-    int total = contentRows + (present > 0 ? present - 1 : 0);   // + blank between items
-
-    int row = 25 - total + 1;   // last line lands on row 25 (blank row 26, bar at 27)
-    if (row < 1) row = 1;
+    int row = ROW_META;
 
     if (!series.empty()) { printf("\x1b[%d;5H%.34s", row, series.c_str()); row += 2; }
     if (!title.empty()) {
@@ -868,7 +872,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     // "Buffering…" hint at the top of the console so a stall reads as buffering
     // rather than a crash. rebuf tracks whether the hint is currently shown.
     bool rebuf = true;
-    if (!g_dbg) printf("\x1b[1;5HBuffering...   ");
+    if (!g_dbg) printf("\x1b[%d;5HBuffering...   ", ROW_STATUS);
 
     // Prebuffer: wait until the ring holds PREBUF_SZ (or the stream ended) so a
     // brief network dip after playback starts doesn't immediately underrun.
@@ -914,7 +918,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
             // Same slot as the buffering hint. It stays up through teardown and
             // the caller's restart — the next playerPlay's consoleInit clears it
             // — so the gap between the press and the new stream isn't dead air.
-            if (!g_dbg) printf("\x1b[1;5HSeeking...     ");
+            if (!g_dbg) printf("\x1b[%d;5HSeeking...     ", ROW_STATUS);
             if (dbg) { fprintf(dbg, "seek to %.1fs (from %.1fs)\n", seekReq, posSec); fflush(dbg); }
             break;
         }
@@ -1025,9 +1029,9 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         // Buffering indicator: clear once frames flow again, re-show on underrun.
         if (!g_dbg) {
             if (processed > 0) {
-                if (rebuf) { printf("\x1b[1;5H               "); rebuf = false; }
+                if (rebuf) { printf("\x1b[%d;5H               ", ROW_STATUS); rebuf = false; }
             } else if (!g_ring.producerDone && !rebuf) {
-                printf("\x1b[1;5HBuffering...   "); rebuf = true;
+                printf("\x1b[%d;5HBuffering...   ", ROW_STATUS); rebuf = true;
             }
         }
 
