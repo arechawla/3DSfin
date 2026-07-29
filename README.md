@@ -54,3 +54,5 @@ Playback:
 - Persistent config — Server URL and username are saved to /3ds/3dsfin/config.ini on the SD card between sessions
 
 
+## Credits
+- thanks to [FourthTube](https://github.com/erievs/FourthTube), for figuring out streaming logic and audio sync issues
