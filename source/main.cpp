@@ -458,11 +458,26 @@ int main() {
                 C2D_Fini();
                 C3D_Fini();
 
-                playerPlay(playerUrl, playItem.runTimeTicks,
-                           playItem.seriesName,
-                           playItem.name,
-                           playItem.productionYear,
-                           playStartSec);
+                // Seeking restarts the transcode at the target time: playerPlay
+                // reports the target via seekTo and we call straight back in with
+                // a fresh stream URL (same mechanism as resume).
+                double seekTo;
+                do {
+                    seekTo = -1.0;
+                    playerPlay(playerUrl, playItem.runTimeTicks,
+                               playItem.seriesName,
+                               playItem.name,
+                               playItem.productionYear,
+                               playStartSec, &seekTo);
+                    // Kill the finished/abandoned transcode job server-side; the
+                    // seek's new stream (fresh PlaySessionId) starts its own.
+                    client.stopTranscode();
+                    if (seekTo >= 0) {
+                        playStartSec = seekTo;
+                        playerUrl    = client.getStreamUrl(
+                            playItem.id, (long long)(seekTo * 10000000.0));
+                    }
+                } while (seekTo >= 0);
 
                 C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
                 C2D_Init(C2D_DEFAULT_MAX_OBJECTS);

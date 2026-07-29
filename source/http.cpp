@@ -20,23 +20,29 @@ void HttpClient::clearHeaders() {
 }
 
 HttpResponse HttpClient::get(const std::string& path) {
-    return request(baseUrl_ + path, false, "", "");
+    return request(baseUrl_ + path, Method::Get, "", "");
 }
 
 HttpResponse HttpClient::post(const std::string& path, const std::string& body,
                               const std::string& contentType) {
-    return request(baseUrl_ + path, true, body, contentType);
+    return request(baseUrl_ + path, Method::Post, body, contentType);
 }
 
-HttpResponse HttpClient::request(const std::string& url, bool isPost,
+HttpResponse HttpClient::del(const std::string& path) {
+    return request(baseUrl_ + path, Method::Delete, "", "");
+}
+
+HttpResponse HttpClient::request(const std::string& url, Method method,
                                  const std::string& postData,
                                  const std::string& contentType) {
     HttpResponse resp{0, ""};
 
     httpcContext ctx;
-    HTTPC_RequestMethod method = isPost ? HTTPC_METHOD_POST : HTTPC_METHOD_GET;
+    HTTPC_RequestMethod hm = method == Method::Post   ? HTTPC_METHOD_POST
+                           : method == Method::Delete ? HTTPC_METHOD_DELETE
+                                                      : HTTPC_METHOD_GET;
 
-    if (R_FAILED(httpcOpenContext(&ctx, method, url.c_str(), 1))) {
+    if (R_FAILED(httpcOpenContext(&ctx, hm, url.c_str(), 1))) {
         resp.status = -1;
         return resp;
     }
@@ -47,7 +53,7 @@ HttpResponse HttpClient::request(const std::string& url, bool isPost,
     for (auto& kv : headers_)
         httpcAddRequestHeaderField(&ctx, kv.first.c_str(), kv.second.c_str());
 
-    if (isPost && !postData.empty()) {
+    if (method == Method::Post && !postData.empty()) {
         httpcAddRequestHeaderField(&ctx, "Content-Type", contentType.c_str());
         httpcAddPostDataRaw(&ctx,
             reinterpret_cast<const u32*>(postData.c_str()),

@@ -142,6 +142,17 @@ static void drawSeekBar(double posSec, double durSec) {
     printf("\x1b[29;5H[%s]", bar);
 }
 
+// Button hints. Skips go on the last console row, under the ends of the seek bar
+// (which spans cols 5..34) so each label sits on the side it seeks toward; exit
+// goes opposite the timecode on row 27, past the space drawSeekBar rewrites.
+// Static: drawn once alongside drawMeta, redrawn when the debug overlay closes.
+static void drawControls() {
+    printf("\x1b[27;29HB EXIT");
+    printf("\x1b[30;5H<< -10s");
+    printf("\x1b[30;17HD-PAD");
+    printf("\x1b[30;28H+30s >>");
+}
+
 // Series name / episode title / year above the seek bar, one blank line between
 // each item. A long title wraps to a second line instead of being truncated.
 // The block is bottom-anchored so it always ends just above the seek bar.
@@ -657,7 +668,8 @@ static void processAAC(unsigned char* buf, int len, FILE* dbg) {
 // ─── Player entry point ───────────────────────────────────────────────────────
 bool playerPlay(const std::string& url, long long runTimeTicks,
                 const std::string& series, const std::string& title, int year,
-                double startSec) {
+                double startSec, double* seekOut) {
+    if (seekOut) *seekOut = -1.0;
     // C2D_CreateScreenTarget replaced gfx's framebuffer pointers with its own VRAM
     // allocation. After C3D_Fini that VRAM is freed but the pointers stay stale.
     // gfxSetScreenFormat is a no-op when the format hasn't changed, so it doesn't
@@ -821,6 +833,9 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
 
     bool dbgComboPrev = false;   // edge-detect for the X + D-Pad Up debug toggle
     bool prodDoneLogged = false; // one-time log when the download stream ends
+    double seekReq = -1.0;       // seek target (sec) requested via D-Pad, -1 = none
+    bool seekPrevL = false, seekPrevR = false;   // edge-detect (held-based: inner
+                                 // hidScanInput calls would eat hidKeysDown edges)
 
     // Seek-bar state: position from PES PTS, total from the Jellyfin item.
     double    durSec      = runTimeTicks > 0 ? runTimeTicks / 10000000.0 : 0.0;
@@ -829,7 +844,10 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     long long curPesPts   = -1;          // PTS of the access unit now being accumulated
     int       lastShownSec = -1;         // throttle: redraw bar only when seconds change
 
-    if (!g_dbg) drawMeta(series, title, year);   // static metadata above the seek bar
+    if (!g_dbg) {                                // static text around the seek bar
+        drawMeta(series, title, year);
+        drawControls();
+    }
 
     // Start the background download thread filling the ring. Same priority as the
     // main thread so the two round-robin on the core; the main thread yields often
@@ -874,10 +892,32 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
             else {                                     // back to clean view: redraw all
                 consoleClear();
                 drawMeta(series, title, year);
+                drawControls();
                 lastShownSec = -1;                     // force seek-bar redraw
             }
         }
         dbgComboPrev = dbgCombo;
+
+        // Seek: D-Pad Left/Right jump -10s/+30s. The live transcode can't be
+        // seeked in-stream, so hand the target back to the caller, which starts
+        // a fresh stream there (same path as resume).
+        bool skL = (hidKeysHeld() & KEY_DLEFT)  != 0;
+        bool skR = (hidKeysHeld() & KEY_DRIGHT) != 0;
+        if ((skL && !seekPrevL) || (skR && !seekPrevR)) {
+            double t = posSec + ((skR && !seekPrevR) ? 30.0 : -10.0);
+            if (durSec > 0 && t > durSec - 10.0) t = durSec - 10.0;
+            if (t < 0) t = 0;
+            seekReq = t;
+        }
+        seekPrevL = skL; seekPrevR = skR;
+        if (seekReq >= 0) {
+            // Same slot as the buffering hint. It stays up through teardown and
+            // the caller's restart — the next playerPlay's consoleInit clears it
+            // — so the gap between the press and the new stream isn't dead air.
+            if (!g_dbg) printf("\x1b[1;5HSeeking...     ");
+            if (dbg) { fprintf(dbg, "seek to %.1fs (from %.1fs)\n", seekReq, posSec); fflush(dbg); }
+            break;
+        }
 
         if (hidKeysDown() & KEY_B) break;
 
@@ -1004,8 +1044,9 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         if (processed == 0) svcSleepThread(5000000LL);   // 5ms
     }
 
-    // Show whatever is still queued at its proper pace before tearing down.
-    if (!stop) displayPump(false, true, &stop, dbg);
+    // Show whatever is still queued at its proper pace before tearing down —
+    // unless the user is seeking away, in which case just drop it.
+    if (!stop && seekReq < 0) displayPump(false, true, &stop, dbg);
 
     DBG("End: pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
     g_paceLog = nullptr;
@@ -1016,7 +1057,8 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         fclose(dbg);
     }
 
-    svcSleepThread(2000000000LL); // show stats for 2s before returning
+    if (seekReq < 0)
+        svcSleepThread(2000000000LL); // show stats for 2s before returning
 
     // Stop the producer: ask it to quit, then cancel any in-flight download so a
     // blocking httpcDownloadData returns and the thread can exit, then join it.
@@ -1032,5 +1074,6 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     linearFree(g_ring.data); linearFree(pesBuf);
     linearFree(nalBuf); linearFree(audBuf);
     freeFifoSlots();
+    if (seekOut) *seekOut = seekReq;
     return true;
 }

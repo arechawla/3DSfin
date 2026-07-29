@@ -2,6 +2,7 @@
 #include <3ds.h>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
 
 // ---------------------------------------------------------------------------
@@ -343,9 +344,18 @@ std::string JellyfinClient::getPrimaryImage(const std::string& itemId, int fillW
 }
 
 std::string JellyfinClient::getStreamUrl(const std::string& itemId,
-                                         long long startTicks) const {
+                                         long long startTicks) {
     // Ask Jellyfin to transcode to H.264/AAC at 3DS-friendly resolution.
     // Phase 2: feed this URL to the MVD hardware decoder.
+
+    // Fresh session id per stream: this is what makes the server actually start
+    // a new transcode at startTicks instead of resuming the previous job.
+    static unsigned seq = 0;
+    char psid[64];
+    snprintf(psid, sizeof(psid), "3dsfin-%llu-%u",
+             (unsigned long long)time(nullptr), ++seq);
+    lastPlaySessionId_ = psid;
+
     char url[1024];
     snprintf(url, sizeof(url),
              "%s/Videos/%s/stream.ts"
@@ -377,8 +387,19 @@ std::string JellyfinClient::getStreamUrl(const std::string& itemId,
              "&SubtitleMethod=None"
              "&IsPlayback=true"
              // Seek the transcode to the resume position (0 = from the start).
-             "&StartTimeTicks=%lld",
+             "&StartTimeTicks=%lld"
+             "&PlaySessionId=%s",
              serverUrl_.c_str(), itemId.c_str(),
-             accessToken_.c_str(), deviceId_.c_str(), startTicks);
+             accessToken_.c_str(), deviceId_.c_str(), startTicks, psid);
     return std::string(url);
+}
+
+void JellyfinClient::stopTranscode() {
+    if (lastPlaySessionId_.empty()) return;
+    char path[256];
+    snprintf(path, sizeof(path),
+             "/Videos/ActiveEncodings?deviceId=%s&playSessionId=%s",
+             deviceId_.c_str(), lastPlaySessionId_.c_str());
+    http_.del(path);
+    lastPlaySessionId_.clear();
 }

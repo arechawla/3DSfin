@@ -52,8 +52,16 @@ public:
 
     // Returns a direct-stream URL pre-configured for 3DS capabilities.
     // startTicks seeks the transcode to a resume position (0 = from the start).
+    // Each call embeds a fresh PlaySessionId: without one, Jellyfin matches the
+    // request to the still-running transcode of the previous stream and ignores
+    // the new StartTimeTicks — which made seeking a no-op.
     std::string getStreamUrl(const std::string& itemId,
-                             long long startTicks = 0) const;
+                             long long startTicks = 0);
+
+    // Tells the server to kill the transcode job of the last getStreamUrl()
+    // stream. Call between seeks (and after playback) so orphaned ffmpeg jobs
+    // don't pile up server-side. Safe to call when nothing is active.
+    void stopTranscode();
 
     // Fetches the raw Primary-image bytes (JPEG) for an item/library, scaled to
     // fillWidth px. Returns an empty string if the item has no image or on error.
@@ -69,6 +77,7 @@ private:
     std::string userId_;
     std::string accessToken_;
     std::string deviceId_;
+    std::string lastPlaySessionId_;   // session of the last getStreamUrl() call
     HttpClient  http_;
 
     void applyAuthHeader();
