@@ -34,7 +34,9 @@ Login with server IP and user credentials:
 Connection will start:
 ![Screenshot](connecting.jpg)
 Full Library Catalog can be browsed:
-![Screenshot](mainscreen.jpg)
+![Screenshot](mainscreennew.jpg)
+Browsing Within Library:
+![Screenshot](librarybrowse.jpg)
 
 
 
