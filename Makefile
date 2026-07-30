@@ -85,6 +85,12 @@ DEPENDS := $(OFILES:.o=.d)
 
 all: $(OUTPUT).3dsx
 
+all: $(OUTPUT).3dsx $(OUTPUT).cia
+
+$(OUTPUT).cia: $(OUTPUT).elf $(OUTPUT).smdh
+	@makerom -f cia -o $@ -elf $(OUTPUT).elf -rsf $(TOPDIR)/assets/$(TARGET).rsf -icon $(TOPDIR)/assets/icon.bin -banner $(TOPDIR)/assets/banner.bnr
+	@echo "built ... $(notdir $@)"
+
 $(OUTPUT).3dsx: $(OUTPUT).elf $(_3DSXDEPS)
 $(OUTPUT).elf:  $(OFILES)
 

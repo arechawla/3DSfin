@@ -1,0 +1,115 @@
+BasicInfo:
+  Title                   : "3DSFin"
+  ProductCode             : "CTR-P-3FIN"
+  Logo                    : Nintendo
+TitleInfo:
+  UniqueId                : 0x3F100
+  Category                : Application
+Option:
+  UseOnSD                 : true
+  EnableCompress          : true
+  FreeProductCode         : true
+AccessControlInfo:
+  ExtSaveDataId           : 0x0000000000000000
+  SystemSaveDataId1       : 0x00000000
+  SystemSaveDataId2       : 0x00000000
+  OtherUserSaveDataId1    : 0x00000000
+  OtherUserSaveDataId2    : 0x00000000
+  OtherUserSaveDataId3    : 0x00000000
+  FileSystemAccess:
+    - DirectSdmc
+  IdealProcessor          : 0
+  AffinityMask            : 1
+  Priority                : 16
+  MaxCpu                  : 0x9E
+  DisableDebug            : false
+  EnableForceDebug        : false
+  CanWriteSharedPage      : false
+  CanUsePrivilegedPriority: false
+  CanUseNonAlphabetAndNumber : false
+  PermitMainFunctionArgument : false
+  CanShareDeviceMemory    : false
+  RunnableOnSleep         : false
+  SpecialMemoryArrange    : false
+  UseOtherVariationSaveData : false
+  CoreVersion             : 2
+  DescVersion             : 2
+  ReleaseKernelMajor      : "02"
+  ReleaseKernelMinor      : "40"
+  MemoryType              : Application
+  HandleTableSize         : 512
+  IORegisterMapping:
+    - 1ff50000-1ff57fff
+    - 1ff70000-1ff77fff
+  MemoryMapping:
+    - 1f000000-1f5fffff:r
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    GetProcessIdealProcessor: 6
+    SetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadAffinityMask: 13
+    SetThreadAffinityMask: 14
+    GetThreadIdealProcessor: 15
+    SetThreadIdealProcessor: 16
+    GetCurrentProcessorNumber: 17
+    Run: 18
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    GetSystemTick: 40
+    GetSystemInfo: 42
+    ConnectToPort: 45
+    SendSyncRequest: 50
+    OpenProcess: 51
+    OpenThread: 52
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    OutputDebugString: 61
+  InterruptNumbers:
+  ServiceAccessControl:
+    - cfg:u
+    - fs:USER
+    - gsp::Gpu
+    - hid:USER
+    - http:C
+    - ir:USER
+    - ptm:u
+    - soc:U
+    - ssl:C
+    - y2r:u
+SystemControlInfo:
+  SaveDataSize: 1M
+  RemasterVersion: 0000
+  StackSize: 0x00010000
+  Dependency:
+    ac: 0x0004013000002402L
+    y2r: 0x0004013000003802L
+    am: 0x0004013000001502L
+    boss: 0x0004013000003402L
+    camera: 0x0004013000001602L
+    cecd: 0x0004013000002602L
+    cfg: 0x0004013000001702L
+    codec: 0x0004013000001802L
+    csnd: 0x0004013000002702L
+    dlp: 0x0004013000002802L
+    dsp: 0x0004013000001a02L
