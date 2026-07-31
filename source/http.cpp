@@ -47,7 +47,7 @@ HttpResponse HttpClient::request(const std::string& url, Method method,
         return resp;
     }
 
-    httpcAddRequestHeaderField(&ctx, "User-Agent", "3DSFin/0.1");
+    httpcAddRequestHeaderField(&ctx, "User-Agent", "3DSFin/0.2");
     httpcAddRequestHeaderField(&ctx, "Accept",     "application/json");
 
     for (auto& kv : headers_)

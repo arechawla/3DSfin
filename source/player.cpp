@@ -800,7 +800,7 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     u32     httpStatus = 0;
     DBG("HTTP open...\n");
     if (R_SUCCEEDED(httpcOpenContext(&ctx, HTTPC_METHOD_GET, url.c_str(), 1))) {
-        httpcAddRequestHeaderField(&ctx, "User-Agent", "3DSFin/0.1");
+        httpcAddRequestHeaderField(&ctx, "User-Agent", "3DSFin/0.2");
         if (R_SUCCEEDED(httpcBeginRequest(&ctx))) {
             httpcGetResponseStatusCode(&ctx, &httpStatus);
             ok = (httpStatus >= 200 && httpStatus < 300);

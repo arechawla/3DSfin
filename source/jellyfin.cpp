@@ -124,7 +124,7 @@ void JellyfinClient::applyAuthHeader() {
     char buf[512];
     snprintf(buf, sizeof(buf),
              "MediaBrowser Client=\"3DSFin\", Device=\"Nintendo 3DS\","
-             " DeviceId=\"%s\", Version=\"0.1.0\", Token=\"%s\"",
+             " DeviceId=\"%s\", Version=\"0.2.0\", Token=\"%s\"",
              deviceId_.c_str(), accessToken_.c_str());
     http_.setHeader("X-Emby-Authorization", buf);
 }
@@ -147,7 +147,7 @@ bool JellyfinClient::authenticate(const std::string& username,
     char authHdr[256];
     snprintf(authHdr, sizeof(authHdr),
              "MediaBrowser Client=\"3DSFin\", Device=\"Nintendo 3DS\","
-             " DeviceId=\"%s\", Version=\"0.1.0\"",
+             " DeviceId=\"%s\", Version=\"0.2.0\"",
              deviceId_.c_str());
     http_.setHeader("X-Emby-Authorization", authHdr);
 
