@@ -217,13 +217,20 @@ static void blitFrame(const u8* mvdOut, u32 frameCount) {
     // Source stride is the coded width (g_decW); clamp to screen bounds.
     u32 maxY = (g_decH < FB_W) ? g_decH : FB_W;   // y maps to screen X (240 wide)
     u32 maxX = (g_decW < FB_H) ? g_decW : FB_H;   // x maps to screen Y (400 tall)
+
+    // Centre the picture in the screen so a frame smaller than 400x240 gets equal
+    // black bars on both sides instead of hugging the top-left corner. A 4:3
+    // source transcodes to 320x240 and otherwise puts all 80px of bar on the right.
+    u32 padX = (FB_H - maxX) / 2;                 // horizontal margin (screen 400 across)
+    u32 padY = (FB_W - maxY) / 2;                 // vertical margin (screen 240 down)
+
     for (u32 y = 0; y < maxY; y++) {
         for (u32 x = 0; x < maxX; x++) {
             u16 px  = src[y * g_decW + x];
             u8  r5  = (px >> 11) & 0x1F;
             u8  g6  = (px >> 5)  & 0x3F;
             u8  b5  =  px        & 0x1F;
-            u32 off = (x * FB_W + (FB_W - 1 - y)) * 3;
+            u32 off = ((x + padX) * FB_W + (FB_W - 1 - (y + padY))) * 3;
             fb[off]     = (b5 << 3) | (b5 >> 2);
             fb[off + 1] = (g6 << 2) | (g6 >> 4);
             fb[off + 2] = (r5 << 3) | (r5 >> 2);
