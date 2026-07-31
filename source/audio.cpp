@@ -127,6 +127,11 @@ void flushQueue() {
     }
 }
 
+void setPaused(bool paused) {
+    if (!g_enabled) return;
+    ndspChnSetPaused(AUDIO_CHN, paused);
+}
+
 double audioClock() {
     if (!g_configured || g_rate <= 0) return -1.0;
     // The ndsp thread flips buffer status asynchronously; a read racing a buffer

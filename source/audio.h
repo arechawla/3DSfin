@@ -50,6 +50,11 @@ unsigned droppedBlocks();
 // push(). No-op if init() failed.
 void flushQueue();
 
+// Halt/resume DSP playback without touching the queue. While paused the channel's
+// sample position is frozen, so audioClock() holds its value and the video pacer's
+// audio servo stays consistent across the pause. No-op if init() failed.
+void setPaused(bool paused);
+
 // Stop playback and release ndsp + buffers.
 void exit();
 

@@ -157,7 +157,8 @@ static void drawSeekBar(double posSec, double durSec) {
 // timecode, past the space drawSeekBar rewrites.
 // Static: drawn once alongside drawMeta, redrawn when the debug overlay closes.
 static void drawControls() {
-    printf("\x1b[%d;29HB EXIT",  ROW_TIME);
+    printf("\x1b[%d;22HA PAUSE", ROW_TIME);
+    printf("\x1b[%d;31HB EXIT",  ROW_TIME);
     printf("\x1b[%d;5H<< -10s",  ROW_HINTS);
     printf("\x1b[%d;17HD-PAD",   ROW_HINTS);
     printf("\x1b[%d;28H+30s >>", ROW_HINTS);
@@ -847,6 +848,9 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     double seekReq = -1.0;       // seek target (sec) requested via D-Pad, -1 = none
     bool seekPrevL = false, seekPrevR = false;   // edge-detect (held-based: inner
                                  // hidScanInput calls would eat hidKeysDown edges)
+    bool paused    = false;      // A toggles: demux, decode, blit and DSP all halt
+    bool pausePrevA = false;     // edge-detect for A (held-based, as above)
+    s64  pausedAt  = 0;          // osGetTime() when the pause began
 
     // Seek-bar state: position from PES PTS, total from the Jellyfin item.
     double    durSec      = runTimeTicks > 0 ? runTimeTicks / 10000000.0 : 0.0;
@@ -931,6 +935,33 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         }
 
         if (hidKeysDown() & KEY_B) break;
+
+        // Pause/resume on A. Held-based edge detect for the same reason as seek.
+        // Pausing simply stops the loop doing any work: no demux, no decode, no
+        // blit (so the last frame stays on screen) and the DSP channel is halted.
+        // The download thread keeps filling the ring and naps once it is full, so
+        // a pause applies HTTP backpressure to the transcode rather than losing data.
+        bool aHeld = (hidKeysHeld() & KEY_A) != 0;
+        if (aHeld && !pausePrevA) {
+            paused = !paused;
+            audio::setPaused(paused);
+            if (paused) {
+                pausedAt = (s64)osGetTime();
+                if (!g_dbg) printf("\x1b[%d;5HPaused         ", ROW_STATUS);
+                if (dbg) { fprintf(dbg, "paused at %.1fs\n", posSec); fflush(dbg); }
+            } else {
+                // Wall time ran on while the stream stood still, so every queued
+                // frame would now look late and the servo would snap. Push the
+                // pacer's anchor forward by exactly the pause length instead.
+                s64 held = (s64)osGetTime() - pausedAt;
+                g_paceWall0 += held;
+                if (!g_dbg) { printf("\x1b[%d;5H               ", ROW_STATUS); rebuf = false; }
+                if (dbg) { fprintf(dbg, "resumed after %lldms\n", (long long)held); fflush(dbg); }
+            }
+        }
+        pausePrevA = aHeld;
+
+        if (paused) { svcSleepThread(30000000LL); continue; }   // input scans at loop top
 
         // Drain whole TS packets out of the ring. Decoding a frame paces+blits
         // inside processH264 (it may sleep); meanwhile dlThread keeps refilling the
@@ -1054,6 +1085,10 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         // Nothing to do this pass (waiting on the network) → yield briefly.
         if (processed == 0) svcSleepThread(5000000LL);   // 5ms
     }
+
+    // Leaving while paused (B or a seek): un-halt the channel so the next stream
+    // isn't silent, and drop what's queued rather than draining it at pace.
+    if (paused) { audio::setPaused(false); paused = false; stop = true; }
 
     // Show whatever is still queued at its proper pace before tearing down —
     // unless the user is seeking away, in which case just drop it.
