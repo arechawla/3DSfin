@@ -19,6 +19,14 @@ struct JellyfinItem {
     long long   resumeTicks;    // saved playback position (0 = start), from UserData
 };
 
+// One selectable audio track of an item (anime typically ships jpn + eng).
+struct JellyfinAudioTrack {
+    int         index;      // absolute stream index — the AudioStreamIndex to request
+    std::string title;      // DisplayTitle, e.g. "Japanese - Opus 2.0 - Stereo"
+    std::string language;   // 3-letter code ("jpn"), empty if untagged
+    bool        isDefault;  // the track the server would pick on its own
+};
+
 // Which children to enumerate beneath a parent when browsing.
 enum class ChildKind {
     Direct,             // a library's direct children: Movies or Series, by name
@@ -50,13 +58,19 @@ public:
     // Each item's resumeTicks holds the saved playback position.
     std::vector<JellyfinItem> getResumeItems(int limit = 12);
 
+    // The item's audio tracks, in stream order. Empty if the item has no audio or
+    // the lookup failed. Used to offer a track picker before starting the stream.
+    std::vector<JellyfinAudioTrack> getAudioTracks(const std::string& itemId);
+
     // Returns a direct-stream URL pre-configured for 3DS capabilities.
     // startTicks seeks the transcode to a resume position (0 = from the start).
+    // audioStreamIndex picks a specific audio track (-1 = let the server choose).
     // Each call embeds a fresh PlaySessionId: without one, Jellyfin matches the
     // request to the still-running transcode of the previous stream and ignores
     // the new StartTimeTicks — which made seeking a no-op.
     std::string getStreamUrl(const std::string& itemId,
-                             long long startTicks = 0);
+                             long long startTicks = 0,
+                             int       audioStreamIndex = -1);
 
     // Tells the server to kill the transcode job of the last getStreamUrl()
     // stream. Call between seeks (and after playback) so orphaned ffmpeg jobs

@@ -54,6 +54,12 @@ public:
                       int selected, int offset,
                       const std::string& title);
 
+    // Audio-track picker shown before playback (SELECT on an item). rows are the
+    // track labels; the item's title goes in the top bar.
+    void drawTrackScreen(const std::string& title,
+                         const std::vector<std::string>& rows,
+                         int selected, int offset);
+
     void drawPlayerScreen(const JellyfinItem& item, const std::string& streamUrl);
 
 private:

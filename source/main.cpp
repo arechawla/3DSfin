@@ -16,6 +16,7 @@ enum AppState {
     STATE_LOADING,
     STATE_LIBRARIES,
     STATE_ITEMS,
+    STATE_TRACKS,   // audio-track picker for the item SELECT was pressed on
     STATE_PLAYER,
     STATE_ERROR,
 };
@@ -26,6 +27,7 @@ enum PendingLoad {
     LOAD_LIBRARIES,
     LOAD_ITEMS,   // open a library: list its movies/series
     LOAD_DRILL,   // open a series/season: list its seasons/episodes (see drillKind)
+    LOAD_TRACKS,  // fetch an item's audio tracks for the picker
 };
 
 // ---- Globals ---------------------------------------------------------------
@@ -176,6 +178,13 @@ static std::string playerUrl;
 static JellyfinItem playItem;
 static double       playStartSec = 0.0;
 static AppState     playReturn   = STATE_ITEMS;
+// Audio track chosen in STATE_TRACKS, -1 = let the server pick its default. Kept
+// across the seek loop in STATE_PLAYER so restarting the transcode keeps the track.
+static int          playAudioIndex = -1;
+// Audio-track picker state (SELECT on a playable item).
+static std::vector<JellyfinAudioTrack> audioTracks;
+static JellyfinItem trackItem;                  // item the picker is for
+static int          selTrack = 0, trackOffset = 0;
 // Target queued for a LOAD_DRILL (set when A is pressed on a series or season).
 static std::string  drillId, drillTitle;
 static ChildKind    drillKind = ChildKind::Seasons;
@@ -321,6 +330,17 @@ int main() {
                     state = STATE_ITEMS;
                     break;
 
+                case LOAD_TRACKS: {
+                    audioTracks = client.getAudioTracks(trackItem.id);
+                    selTrack    = 0;
+                    trackOffset = 0;
+                    // Start on the track the server would have chosen anyway.
+                    for (int i = 0; i < (int)audioTracks.size(); i++)
+                        if (audioTracks[i].isDefault) { selTrack = i; break; }
+                    state = STATE_TRACKS;
+                    break;
+                }
+
                 default: break;
             }
             pending = LOAD_NONE;
@@ -372,11 +392,12 @@ int main() {
                     if (selResume >= resumeOffset + UI::RESUME_VISIBLE)
                         resumeOffset = selResume - UI::RESUME_VISIBLE + 1;
                     if (kDown & KEY_A && rn > 0) {
-                        playItem     = resumeItems[selResume];
-                        playStartSec = playItem.resumeTicks / 10000000.0;
-                        playerUrl    = client.getStreamUrl(playItem.id, playItem.resumeTicks);
-                        playReturn   = STATE_LIBRARIES;
-                        state        = STATE_PLAYER;
+                        playItem       = resumeItems[selResume];
+                        playStartSec   = playItem.resumeTicks / 10000000.0;
+                        playAudioIndex = -1;    // server default from the resume strip
+                        playerUrl      = client.getStreamUrl(playItem.id, playItem.resumeTicks);
+                        playReturn     = STATE_LIBRARIES;
+                        state          = STATE_PLAYER;
                     }
                     break;
                 }
@@ -441,12 +462,48 @@ int main() {
                         pending    = LOAD_DRILL;
                         state      = STATE_LOADING;
                     } else {
-                        playItem     = it;
-                        playStartSec = it.resumeTicks / 10000000.0;
-                        playerUrl    = client.getStreamUrl(it.id, it.resumeTicks);
-                        playReturn   = STATE_ITEMS;
-                        state        = STATE_PLAYER;
+                        playItem       = it;
+                        playStartSec   = it.resumeTicks / 10000000.0;
+                        playAudioIndex = -1;      // A plays with the server's default
+                        playerUrl      = client.getStreamUrl(it.id, it.resumeTicks);
+                        playReturn     = STATE_ITEMS;
+                        state          = STATE_PLAYER;
                     }
+                }
+
+                // SELECT on a playable item opens the audio-track picker. Series
+                // and seasons have no streams of their own, so it does nothing there.
+                if (kDown & KEY_SELECT && n > 0) {
+                    JellyfinItem& it = lv.items[lv.sel];
+                    if (it.type != "Series" && it.type != "Season") {
+                        trackItem = it;
+                        loadMsg   = "Loading audio tracks...";
+                        pending   = LOAD_TRACKS;
+                        state     = STATE_LOADING;
+                    }
+                }
+                break;
+            }
+
+            case STATE_TRACKS: {
+                if (kDown & KEY_B) { state = STATE_ITEMS; break; }
+
+                int n = (int)audioTracks.size();
+                if (kDown & KEY_DOWN && selTrack < n - 1) selTrack++;
+                if (kDown & KEY_UP   && selTrack > 0)     selTrack--;
+                if (selTrack < trackOffset) trackOffset = selTrack;
+                if (selTrack >= trackOffset + UI::VISIBLE_ROWS)
+                    trackOffset = selTrack - UI::VISIBLE_ROWS + 1;
+
+                if (kDown & KEY_A && n > 0) {
+                    playItem       = trackItem;
+                    playStartSec   = trackItem.resumeTicks / 10000000.0;
+                    playAudioIndex = audioTracks[selTrack].index;
+                    playerUrl      = client.getStreamUrl(trackItem.id,
+                                                         trackItem.resumeTicks,
+                                                         playAudioIndex);
+                    playReturn     = STATE_ITEMS;
+                    state          = STATE_PLAYER;
                 }
                 break;
             }
@@ -474,8 +531,11 @@ int main() {
                     client.stopTranscode();
                     if (seekTo >= 0) {
                         playStartSec = seekTo;
+                        // Carry the chosen audio track across the restart, or the
+                        // seek would silently drop back to the server's default.
                         playerUrl    = client.getStreamUrl(
-                            playItem.id, (long long)(seekTo * 10000000.0));
+                            playItem.id, (long long)(seekTo * 10000000.0),
+                            playAudioIndex);
                     }
                 } while (seekTo >= 0);
 
@@ -537,6 +597,19 @@ int main() {
             case STATE_ITEMS: {
                 BrowseLevel& lv = browseStack.back();
                 ui.drawItemGrid(lv.items, lv.covers, lv.sel, lv.offset, lv.title);
+                break;
+            }
+            case STATE_TRACKS: {
+                std::vector<std::string> rows;
+                for (const auto& t : audioTracks) {
+                    // Jellyfin's DisplayTitle usually ends in "- Default" already;
+                    // only add our own marker when it doesn't say so.
+                    bool marked = t.title.find("Default") != std::string::npos;
+                    rows.push_back(t.isDefault && !marked ? t.title + "   (default)"
+                                                          : t.title);
+                }
+                if (rows.empty()) rows.push_back("(no audio tracks found)");
+                ui.drawTrackScreen(trackItem.name, rows, selTrack, trackOffset);
                 break;
             }
             case STATE_PLAYER:

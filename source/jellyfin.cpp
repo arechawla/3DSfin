@@ -343,8 +343,47 @@ std::string JellyfinClient::getPrimaryImage(const std::string& itemId, int fillW
     return resp.body;            // raw JPEG bytes (binary-safe)
 }
 
+std::vector<JellyfinAudioTrack> JellyfinClient::getAudioTracks(const std::string& itemId) {
+    std::vector<JellyfinAudioTrack> result;
+
+    // Ids= returns the full item including MediaSources; MediaStreams lives inside
+    // the first source. Same /Users/{id}/Items shape the browse calls use.
+    char path[512];
+    snprintf(path, sizeof(path),
+             "/Users/%s/Items?Ids=%s&Fields=MediaSources&Limit=1",
+             userId_.c_str(), itemId.c_str());
+
+    auto resp = http_.get(path);
+    if (!resp.ok()) return result;
+
+    // First MediaStreams array = the first media source's streams (all we play).
+    std::string streams = jArr(resp.body, "MediaStreams");
+    if (streams.empty()) return result;
+
+    jForEach(streams, [&](const std::string& obj) {
+        if (jStr(obj, "Type") != "Audio") return;
+
+        JellyfinAudioTrack t;
+        std::string idx = jStr(obj, "Index");
+        if (idx.empty()) return;                  // no index = nothing to request
+        t.index     = std::stoi(idx);
+        t.title     = jStr(obj, "DisplayTitle");
+        t.language  = jStr(obj, "Language");
+        t.isDefault = jStr(obj, "IsDefault") == "true";
+
+        // DisplayTitle is normally populated; fall back to whatever identifies it.
+        if (t.title.empty()) {
+            t.title = t.language.empty() ? jStr(obj, "Codec") : t.language;
+            if (t.title.empty()) t.title = "Track " + std::to_string(t.index);
+        }
+        result.push_back(t);
+    });
+    return result;
+}
+
 std::string JellyfinClient::getStreamUrl(const std::string& itemId,
-                                         long long startTicks) {
+                                         long long startTicks,
+                                         int       audioStreamIndex) {
     // Ask Jellyfin to transcode to H.264/AAC at 3DS-friendly resolution.
     // Phase 2: feed this URL to the MVD hardware decoder.
 
@@ -391,7 +430,13 @@ std::string JellyfinClient::getStreamUrl(const std::string& itemId,
              "&PlaySessionId=%s",
              serverUrl_.c_str(), itemId.c_str(),
              accessToken_.c_str(), deviceId_.c_str(), startTicks, psid);
-    return std::string(url);
+
+    std::string out(url);
+    // Absolute stream index from getAudioTracks(). Omitted entirely when -1 so the
+    // server applies its own default-track rules, exactly as before.
+    if (audioStreamIndex >= 0)
+        out += "&AudioStreamIndex=" + std::to_string(audioStreamIndex);
+    return out;
 }
 
 void JellyfinClient::stopTranscode() {

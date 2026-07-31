@@ -425,7 +425,21 @@ void UI::drawItemGrid(const std::vector<JellyfinItem>& items,
     bool drillable = !items.empty() && selected < (int)items.size()
                   && items[selected].type == "Series";
     drawBottomHints(drillable ? "A: Open   B: Back   D-Pad: Move"
-                              : "A: Play   B: Back   D-Pad: Move");
+                              : "A: Play   SELECT: Audio   B: Back");
+}
+
+void UI::drawTrackScreen(const std::string& title,
+                         const std::vector<std::string>& rows,
+                         int selected, int offset) {
+    C2D_SceneBegin(top_);
+    drawTopBar("Audio Track");
+    drawScrollList(rows, selected, offset);
+
+    C2D_SceneBegin(bot_);
+    drawRect(0, 0, BOT_W, BOT_H, COL_BG_BOT);
+    drawTextBuf(title, 8, 40, 0.50f, COL_WHITE, BOT_W - 16);
+    drawText("Pick the language to stream.", 8, 96, 0.44f, COL_GREY);
+    drawBottomHints("A: Play   B: Back   D-Pad: Move");
 }
 
 void UI::drawPlayerScreen(const JellyfinItem& item, const std::string& streamUrl) {
