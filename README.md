@@ -7,6 +7,7 @@
 ## Install 
  ### Prerequisites
   - [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the `3ds-dev` group installed
+  - [MakeRom](https://github.com/3DSGuy/Project_CTR/releases/tag/makerom-v0.18.3) installed in `~\devkitPro\tools\bin` for .cia build
 
   ### Build
 
