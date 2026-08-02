@@ -5,11 +5,20 @@
 
 
 ## Install 
- ### Prerequisites
+
+ ### 1. Remote Install (FBI):
+ ![QR](3dsfinqr.png)
+
+ ### 2. Manual Install
+ Donwload from releases tab and drag to `cias` folder on sd card. 
+
+ ### 3. Build From Source:
+
+ #### Prerequisites
   - [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the `3ds-dev` group installed
   - [MakeRom](https://github.com/3DSGuy/Project_CTR/releases/tag/makerom-v0.18.3) installed in `~\devkitPro\tools\bin` for .cia build
 
-  ### Build
+  #### Build
 
   **Linux / macOS**
   ```bash
@@ -25,13 +34,12 @@
   $env:DEVKITARM = "C:/devkitPro/devkitARM"
   $env:PATH = "C:\devkitPro\msys2\usr\bin;C:\devkitPro\devkitARM\bin;C:\devkitPro\tools\bin;$env:PATH"
   C:\devkitPro\msys2\usr\bin\make.exe
-
-  Output: 3dsfin.3dsx
   ```
 
+Output: `3dsfin.3dsx, 3dsfin.cia`
+
+
 ## Setup
-After moving `3dsfin.3dsx` to 3DS, launch homebrew to find application:
-![Screenshot](3dsfinhomebrewlauncher.jpg)
 Login with server IP and user credentials:
 ![Screenshot](3dsfinlogindualscreen.jpg)
 Connection will start:
@@ -46,13 +54,7 @@ Playback:
 
 
 ## Current Status
-3DSfin is in very early development. 3DSfin suports the following features:
-- Video Playback and Audio Playback of your jellyfin library.
-- Server Adding: Enter your jellyfin server URL via the on-screen keyboard
-- Full Library Browsing: Scrollable list of all your Jellyfin Libraries. Browse
-- Metadata Viwe: Displays title, year, duration, and media type
-- Stream URL retrieval: Requests a server-transcoded H.264/AAC MPEG-TS stream at 400×240 (240p) and 1.5 Mbps
-- Persistent config — Server URL and username are saved to /3ds/3dsfin/config.ini on the SD card between sessions
+3DSfin is in very early (alpha) development. Check out release notes for versions in releases tab for the latest updates.
 
 
 ## Credits
