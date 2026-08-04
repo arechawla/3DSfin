@@ -1,7 +1,9 @@
 # 3DSFin
-**Video and audio playback of your entire jellyfin catalog, on your new 3ds!**
-
+Video playback of your entire jellyfin catalog, on your New 3ds!
 3DSfin is a *work in progress* jellyfin client for New Nintendo 3DS. 
+
+[![GitHub Release](https://img.shields.io/github/v/release/arechawla/3dsfin)](https://github.com/arechawla/3DSfin/releases) ![Downloads](https://img.shields.io/github/downloads/arechawla/3dsfin/total)
+
 
 
 ## Install 
