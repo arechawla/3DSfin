@@ -4,15 +4,13 @@ Video playback of your entire jellyfin catalog, on your New 3ds!
 
 [![GitHub Release](https://img.shields.io/github/v/release/arechawla/3dsfin)](https://github.com/arechawla/3DSfin/releases) ![Downloads](https://img.shields.io/github/downloads/arechawla/3dsfin/total)
 
-
+*NOTE:* .cia does **not** work as of now. Use .3dsx and launch from homebrew for working version.
 
 ## Install 
 
- ### 1. Remote Install (FBI):
- ![QR](3dsfinqr.png)
 
- ### 2. Manual Install
- Donwload from releases tab and drag to `cias` folder on sd card. 
+ ### 1. Manual Install
+ Donwload from releases tab and place onto 3ds sd card, launch from homebrew 
 
  ### 3. Build From Source:
 
